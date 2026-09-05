@@ -61,7 +61,9 @@ namespace Unity.Physics
                 float3 sectorMin = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS;
                 float3 sectorMax = (sectorCoord + 1) * Sector.SECTOR_SIZE_IN_BLOCKS;
                 
-                // TODO: FIXME: Seems still unusable; change to this sane thing after finished the blockAABB update
+                // Whole-sector bound on purpose. Sector.blockAABB is a grow-only upper bound that is
+                // never shrunk, not persisted, and not maintained by every writer (see its field doc in
+                // Caelix-Core Sector.cs). Switch to it once a RecomputeBlockAABB pass exists:
                 // float3 sectorMin = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS + m_Sectors[keys[i]].Ptr->blockAABB.Min;
                 // float3 sectorMax = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS + m_Sectors[keys[i]].Ptr->blockAABB.Max;
 
