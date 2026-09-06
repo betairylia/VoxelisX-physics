@@ -102,6 +102,7 @@ namespace Caelix
 
         /// <summary>
         /// Refreshes mass properties and the physics slot from the owning entity's voxel data.
+        /// Called by the server world after dirty propagation and before forces and simulation.
         /// </summary>
         public MassProperties ComputePhysicsProperties(in VoxelEntityData entity)
         {
@@ -142,12 +143,9 @@ namespace Caelix
                 {
                     ref Sector sector = ref kvp.Value.Get();
                     bool cached = sectorMassCache.ContainsKey(kvp.Key);
-                    // Use sectorRequireUpdateFlags (the propagated, consumer-facing flag), not
-                    // sectorDirtyFlags (the raw source flag). The source flag is cleared by
-                    // the host world's Clear Dirty Flags step at the end of dirty propagation,
-                    // which runs BEFORE this refresh, so reading it here would always see 0 and
-                    // mass properties would never be recomputed after a SetBlock. This now
-                    // matches RefreshPhysicsSlot, which has always read the require-update flag.
+                    // Consume the work selected by server dirty propagation, just as
+                    // RefreshPhysicsSlot does. Source dirty flags remain alive for replication
+                    // until EndTick; they describe writes, rather than scheduled consumer work.
                     if (cached && (sector.sectorRequireUpdateFlags & (ushort)dirtyMask) == 0)
                     {
                         continue;
