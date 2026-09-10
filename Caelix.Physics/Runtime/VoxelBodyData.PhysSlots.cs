@@ -9,17 +9,19 @@ namespace Caelix
     public partial struct VoxelBodyData : IDisposable
     {
         /// <summary>
-        /// Recomputes the per-block <see cref="PhysicsInfo"/> slot for every sector that has pending
+        /// Recomputes the per-block <see cref="PhysicsInfo"/> slot of every brick that has pending
         /// require-update flags matching <paramref name="dirtyMask"/>. The slot encodes, for each
         /// solid block, the cells of the voxel-center cubical complex that are rooted at that block
         /// and are COLLISION-ACTIVE. The slot's aux bitmap is rebuilt in the same pass and marks the
         /// physics-key roots: a root is a key when it carries an active point or an active edge.
-        /// Cross-sector topology is resolved through neighbor handles.
+        /// Cross-brick topology is resolved through the 27-brick read window of the facade.
         /// </summary>
         /// <remarks>
-        /// Gating uses the require-update (read) buffers populated by dirty propagation, mirroring the
-        /// sector renderer. The brick-level <c>GeometryWithLocalNeighbor</c> flag already covers bricks
-        /// adjacent to a geometry change, so boundary blocks whose exposure flipped are re-evaluated too.
+        /// Selection uses the require-update (read) buffers populated by dirty propagation, mirroring
+        /// the mesh renderer, plus the bricks whose slot storage was just created and therefore holds
+        /// no valid derived data yet. The brick-level <c>GeometryWithLocalNeighbor</c> flag already
+        /// covers bricks adjacent to a geometry change, so boundary blocks whose exposure flipped are
+        /// re-evaluated too.
         ///
         /// The key rule is deliberately ROOT-LOCAL. The previous rule ("a root is a key when one of
         /// its cells covers a sparse seed voxel") was a two-step dependency - root, covered voxel,
@@ -33,110 +35,95 @@ namespace Caelix
         ///
         /// Every output is derived from block occupancy alone, never from another brick's
         /// <see cref="PhysicsInfo"/> or key bits. That matters because those are rewritten in place:
-        /// a brick that is not flagged this update still holds the previous update's ACTIVE bytes
+        /// a brick that is not selected this update still holds the previous update's ACTIVE bytes
         /// and key bits, so reading them as if they were raw occupancy would mix two representations.
         /// Occupancy is stable input for the whole refresh, so one parallel pass per brick is race
         /// free and deterministic.
         /// </remarks>
         private unsafe void RefreshPhysicsSlot(
-            SharedHashMap<int3, SectorHandle> sectors,
-            SharedHashMap<int3, SectorNeighborHandles> sectorNeighbors,
+            in VoxelEntityData entity,
             DirtyFlags dirtyMask = DirtyFlags.GeometryWithLocalNeighbor)
         {
-            if (sectors.Count == 0)
+            if (entity.RegionCount == 0)
             {
                 return;
             }
 
-            var inputs = new NativeList<PhysicsSlotInput>(sectors.Count, Allocator.TempJob);
+            var keys = new NativeList<int3>(Allocator.TempJob);
+            var required = new NativeList<RequiredBrick>(Allocator.TempJob);
+            var unique = new NativeHashSet<int3>(64, Allocator.Temp);
             try
             {
-                foreach (var kvp in sectors)
+                // Slot storage is created or grown on the main thread; the job only writes into
+                // existing memory. The bricks reported here hold no valid derived data yet.
+                entity.EnsureSlot<PhysicsInfo>(SectorSlotId.PhysicsInfo, BrickBitmask.Bytes, keys);
+                entity.CollectRequiredBricks(default, dirtyMask, false, required);
+
+                for (int i = 0; i < keys.Length; i++)
                 {
-                    ref Sector sector = ref kvp.Value.Get();
-                    SectorSlotStorage* physSlot = sector.slots + (int)SectorSlotId.PhysicsInfo;
-                    bool fullRebuild = !physSlot->IsCreated ||
-                                       physSlot->stride != sizeof(PhysicsInfo) ||
-                                       !physSlot->HasAux;
-                    if (!fullRebuild && (sector.sectorRequireUpdateFlags & (ushort)dirtyMask) == 0)
-                    {
-                        continue;
-                    }
-
-                    // Neighbor handles are maintained in lock-step with the sectors map
-                    // (VoxelEntityData.AddSectorAt/RemoveSectorAt); a missing entry would make
-                    // cross-boundary reads dereference null, so skip defensively if absent.
-                    if (!sectorNeighbors.TryGetValue(kvp.Key, out SectorNeighborHandles neighbors))
-                    {
-                        continue;
-                    }
-
-                    // The slot writes happen inside the parallel job; allocate the backing storage
-                    // here on the main thread so the job only ever writes into existing memory.
-                    if (physSlot->IsCreated && physSlot->stride != sizeof(PhysicsInfo))
-                    {
-                        // PhysicsInfo is derived from Block occupancy. A saved or hot-reloaded cache
-                        // with an older layout must be replaced before typed writes begin.
-                        physSlot->Dispose();
-                        *physSlot = default;
-                    }
-                    sector.EnsureSlotAllocated<PhysicsInfo>(
-                        SectorSlotId.PhysicsInfo, BrickBitmask.Bytes);
-
-                    inputs.Add(new PhysicsSlotInput
-                    {
-                        Sector = kvp.Value,
-                        Neighbors = neighbors,
-                        FullRebuild = fullRebuild
-                    });
+                    unique.Add(keys[i]);
                 }
 
-                if (inputs.Length == 0)
+                for (int i = 0; i < required.Length; i++)
+                {
+                    unique.Add(required[i].Key);
+                }
+
+                // The key list IS the selection; order does not matter.
+                keys.Clear();
+                foreach (int3 key in unique)
+                {
+                    keys.Add(key);
+                }
+
+                if (keys.Length == 0)
                 {
                     return;
                 }
 
-                var job = new ComputePhysicsSlotJob
+                new ComputePhysicsSlotJob
                 {
-                    inputs = inputs.AsArray(),
-                    dirtyMask = (ushort)dirtyMask
-                };
-                job.Schedule(inputs.Length, 1).Complete();
+                    entity = entity,
+                    keys = keys.AsArray()
+                }.Schedule(keys.Length, 8).Complete();
             }
             finally
             {
-                if (inputs.IsCreated)
+                if (unique.IsCreated)
                 {
-                    inputs.Dispose();
+                    unique.Dispose();
+                }
+
+                if (required.IsCreated)
+                {
+                    required.Dispose();
+                }
+
+                if (keys.IsCreated)
+                {
+                    keys.Dispose();
                 }
             }
         }
 
-        private struct PhysicsSlotInput
-        {
-            public SectorHandle Sector;
-            public SectorNeighborHandles Neighbors;
-            public bool FullRebuild;
-        }
-
         /// <summary>
-        /// Burst job that fills the <see cref="PhysicsInfo"/> slot of one sector per index. Each index
-        /// writes only into its own sector's slot storage (reads may cross into neighbor sectors), so
-        /// running sectors in parallel is data-race free.
+        /// Burst job that fills the <see cref="PhysicsInfo"/> slot of one brick per index. Each index
+        /// writes only into its own brick's slot data and aux (reads may cross into the 26 neighbor
+        /// bricks), so running the selected bricks in parallel is data-race free.
         /// </summary>
         /// <remarks>
         /// Per brick the job first loads an occupancy window covering the brick plus a one-voxel halo
         /// on each side. The window is stored as one 10-bit row of X per (Y, Z) pair, so cell
         /// existence, activity and the key mask all become AND/OR/shift chains over eight voxels at a
         /// time. The window is filled from the Block slot's per-brick occupancy bitmask (rebuilt by
-        /// <c>RefreshNonEmptyMask</c> immediately before this pass), which costs 27 brick lookups per
-        /// brick instead of one lookup per neighbor test.
+        /// <c>RefreshNonEmptyMask</c> immediately before this pass), which the facade binds for all
+        /// 27 neighbors in one call instead of one lookup per neighbor test.
         /// </remarks>
         [BurstCompile]
-        private struct ComputePhysicsSlotJob : IJobParallelFor
+        private unsafe struct ComputePhysicsSlotJob : IJobParallelFor
         {
-            [ReadOnly] public NativeArray<PhysicsSlotInput> inputs;
-            public ushort dirtyMask;
+            [ReadOnly] public VoxelEntityData entity;
+            [ReadOnly] public NativeArray<int3> keys;
 
             // Window bounds in brick-local block coordinates. The low end reaches -1 because the cell
             // grown one voxel back is what a cell competes against for its negative directions. The
@@ -147,12 +134,12 @@ namespace Caelix
             // +2 would read voxels whose edits never flag this brick. Do not widen this without
             // widening s_voxelPropagationMasks to match.
             private const int WindowLow = -1;
-            private const int WindowHigh = Sector.SIZE_IN_BLOCKS;
+            private const int WindowHigh = BrickKey.BlocksPerAxis;
             private const int WindowSpan = WindowHigh - WindowLow + 1;
             private const int WindowRows = WindowSpan * WindowSpan;
 
             // Highest root coordinate.
-            private const int RootHigh = Sector.SIZE_IN_BLOCKS - 1;
+            private const int RootHigh = BrickKey.BlocksPerAxis - 1;
 
             // Bit b of a window row holds the occupancy of x = b - 1.
             private const int RowBitOrigin = -WindowLow;
@@ -161,49 +148,25 @@ namespace Caelix
 
             public unsafe void Execute(int index)
             {
-                PhysicsSlotInput input = inputs[index];
-                SectorHandle handle = input.Sector;
-                ref Sector sector = ref handle.Get();
-
-                SectorSlotStorage* physSlot = sector.slots + (int)SectorSlotId.PhysicsInfo;
-                if (!physSlot->IsCreated || !physSlot->HasAux)
+                int3 key = keys[index];
+                if (!entity.TryBindBrick<PhysicsInfo>(SectorSlotId.PhysicsInfo, key, out PhysicsInfo* physBrick) ||
+                    !entity.TryBindBrickAux(SectorSlotId.PhysicsInfo, key, out void* keyMask))
                 {
                     return;
                 }
 
-                var helper = new SectorNeighborhoodReaderHelper(handle, input.Neighbors);
-
-                // Scratch for the whole sector; one brick is processed at a time.
+                // Scratch for one brick.
                 ulong** brickMasks = stackalloc ulong*[NeighborBrickCount];
                 Block** brickBlocks = stackalloc Block*[NeighborBrickCount];
                 uint* occupancyRows = stackalloc uint[WindowRows];
                 uint* cellRows = stackalloc uint[PhysicsInfo.FeatureBitCount * WindowRows];
                 uint* activeRows = stackalloc uint[PhysicsInfo.FeatureBitCount];
 
-                foreach (SectorNonEmptyBrickEnumerator.BrickRef brickRef in sector.EnumerateNonEmptyBricks())
-                {
-                    int brickIdxAbs = brickRef.BrickAbs;
-                    if (!input.FullRebuild &&
-                        (sector.brickRequireUpdateFlags[brickIdxAbs] & dirtyMask) == 0)
-                    {
-                        continue;
-                    }
-
-                    short bid = brickRef.Bid;
-                    var physBrick = (PhysicsInfo*)physSlot->GetBrickPtr(bid);
-                    var physicsKeyMask = (ulong*)physSlot->GetBrickAuxPtr(bid);
-                    if (physBrick == null || physicsKeyMask == null)
-                    {
-                        continue;
-                    }
-
-                    int3 brickBlockPos = Sector.ToBrickPos((short)brickIdxAbs) * Sector.SIZE_IN_BLOCKS;
-
-                    LoadNeighborBricks(ref helper, brickBlockPos, brickMasks, brickBlocks);
-                    LoadOccupancyWindow(brickMasks, brickBlocks, occupancyRows);
-                    ComputeCellRows(occupancyRows, cellRows);
-                    WriteBrick(cellRows, activeRows, physBrick, physicsKeyMask);
-                }
+                VoxelNeighborhood window = entity.OpenNeighborhood(key, SectorSlotId.Block);
+                LoadNeighborBricks(ref window, brickMasks, brickBlocks);
+                LoadOccupancyWindow(brickMasks, brickBlocks, occupancyRows);
+                ComputeCellRows(occupancyRows, cellRows);
+                WriteBrick(cellRows, activeRows, physBrick, (ulong*)keyMask);
             }
 
             /// <summary>Row index of one X row of the occupancy window.</summary>
@@ -213,13 +176,12 @@ namespace Caelix
             }
 
             /// <summary>
-            /// Caches the 3x3x3 bricks the window spans. Absent bricks and sectors stay null and read
-            /// as empty. The occupancy bitmask is preferred; the raw blocks are the fallback for a
-            /// brick whose Block slot carries no aux yet.
+            /// Caches the 3x3x3 bricks the window spans. Absent bricks stay null and read as empty.
+            /// The occupancy bitmask is preferred; the raw blocks are the fallback for a brick whose
+            /// Block slot carries no aux yet.
             /// </summary>
             private static unsafe void LoadNeighborBricks(
-                ref SectorNeighborhoodReaderHelper helper,
-                int3 brickBlockPos,
+                ref VoxelNeighborhood window,
                 ulong** brickMasks,
                 Block** brickBlocks)
             {
@@ -229,21 +191,12 @@ namespace Caelix
                     {
                         for (int dx = -1; dx <= 1; dx++)
                         {
-                            int3 blockPos = brickBlockPos +
-                                            new int3(dx, dy, dz) * Sector.SIZE_IN_BLOCKS;
-                            int slot = NeighborIndex(dx, dy, dz);
-                            brickMasks[slot] = (ulong*)helper.GetBrickAuxPtrAtBlock(
-                                SectorSlotId.Block, blockPos);
-                            brickBlocks[slot] = helper.GetBrickPtrAtBlock<Block>(
-                                SectorSlotId.Block, blockPos);
+                            int slot = VoxelNeighborhood.Index(dx, dy, dz);
+                            brickMasks[slot] = (ulong*)window.GetAuxPtr(slot);
+                            brickBlocks[slot] = window.GetBrickPtr(slot);
                         }
                     }
                 }
-            }
-
-            private static int NeighborIndex(int dx, int dy, int dz)
-            {
-                return ((dz + 1) * 3 + (dy + 1)) * 3 + (dx + 1);
             }
 
             /// <summary>Occupancy of one in-brick X row, as eight bits with x at bit x.</summary>
@@ -253,8 +206,8 @@ namespace Caelix
                 ulong* mask = brickMasks[slot];
                 if (mask != null)
                 {
-                    // One mask word covers one Z slice; within it a row starts at y * SIZE_IN_BLOCKS.
-                    return (uint)((mask[z] >> (y << Sector.SHIFT_IN_BLOCKS)) & 0xFFul);
+                    // One mask word covers one Z slice; within it a row starts at y * BlocksPerAxis.
+                    return (uint)((mask[z] >> (y << BrickKey.Shift)) & 0xFFul);
                 }
 
                 Block* blocks = brickBlocks[slot];
@@ -263,9 +216,9 @@ namespace Caelix
                     return 0u;
                 }
 
-                int baseIdx = Sector.ToBlockIdx(0, y, z);
+                int baseIdx = BrickKey.ToBlockIdx(0, y, z);
                 uint bits = 0u;
-                for (int x = 0; x < Sector.SIZE_IN_BLOCKS; x++)
+                for (int x = 0; x < BrickKey.BlocksPerAxis; x++)
                 {
                     bits |= blocks[baseIdx + x].isEmpty ? 0u : (1u << x);
                 }
@@ -283,22 +236,22 @@ namespace Caelix
             {
                 for (int z = WindowLow; z <= WindowHigh; z++)
                 {
-                    int brickZ = z >> Sector.SHIFT_IN_BLOCKS;
-                    int localZ = z & Sector.BRICK_MASK;
+                    int brickZ = z >> BrickKey.Shift;
+                    int localZ = z & BrickKey.Mask;
                     for (int y = WindowLow; y <= WindowHigh; y++)
                     {
-                        int brickY = y >> Sector.SHIFT_IN_BLOCKS;
-                        int localY = y & Sector.BRICK_MASK;
+                        int brickY = y >> BrickKey.Shift;
+                        int localY = y & BrickKey.Mask;
 
-                        int centre = NeighborIndex(0, brickY, brickZ);
+                        int centre = VoxelNeighborhood.Index(0, brickY, brickZ);
                         uint low = BrickRowBits(brickMasks, brickBlocks, centre - 1, localY, localZ);
                         uint mid = BrickRowBits(brickMasks, brickBlocks, centre, localY, localZ);
                         uint high = BrickRowBits(brickMasks, brickBlocks, centre + 1, localY, localZ);
 
                         occupancyRows[RowIndex(y, z)] =
-                            (low >> (Sector.SIZE_IN_BLOCKS - RowBitOrigin)) |
+                            (low >> (BrickKey.BlocksPerAxis - RowBitOrigin)) |
                             (mid << RowBitOrigin) |
-                            (high << (Sector.SIZE_IN_BLOCKS + RowBitOrigin));
+                            (high << (BrickKey.BlocksPerAxis + RowBitOrigin));
                     }
                 }
             }
@@ -412,16 +365,16 @@ namespace Caelix
                 PhysicsInfo* physBrick,
                 ulong* physicsKeyMask)
             {
-                for (int z = 0; z < Sector.SIZE_IN_BLOCKS; z++)
+                for (int z = 0; z < BrickKey.BlocksPerAxis; z++)
                 {
                     ulong keyWord = 0ul;
-                    for (int y = 0; y < Sector.SIZE_IN_BLOCKS; y++)
+                    for (int y = 0; y < BrickKey.BlocksPerAxis; y++)
                     {
                         ComputeActiveRows(cellRows, y, z, activeRows);
                         uint keyRow = ComputeKeyRow(activeRows);
 
-                        int baseIdx = Sector.ToBlockIdx(0, y, z);
-                        for (int x = 0; x < Sector.SIZE_IN_BLOCKS; x++)
+                        int baseIdx = BrickKey.ToBlockIdx(0, y, z);
+                        for (int x = 0; x < BrickKey.BlocksPerAxis; x++)
                         {
                             int bit = x + RowBitOrigin;
                             uint data = 0u;
@@ -433,7 +386,7 @@ namespace Caelix
                         }
 
                         keyWord |= (ulong)((keyRow >> RowBitOrigin) & 0xFFu) <<
-                                   (y << Sector.SHIFT_IN_BLOCKS);
+                                   (y << BrickKey.Shift);
                     }
                     physicsKeyMask[z] = keyWord;
                 }

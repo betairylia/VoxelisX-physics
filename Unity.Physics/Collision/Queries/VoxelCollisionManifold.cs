@@ -100,11 +100,11 @@ namespace Unity.Physics
             public ulong* PhysicsKeyMask;
         }
 
-        // Direct-mapped cache of resolved bricks, indexed by the low bits of the brick coordinate
-        // rather than by a hash.
+        // Direct-mapped cache of resolved bricks, indexed by the low bits of the brick key rather
+        // than by a hash.
         //
         // Every key voxel sweeps a window a few voxels wide and requests two to four bricks to read
-        // a handful of voxels, so without this each one repeats a sector hash lookup. Neighbouring
+        // a handful of voxels, so without this each one repeats a storage lookup. Neighbouring
         // source voxels - and neighbouring source bricks - request overlapping sets, and indexing
         // by position keeps those in the same slots, so the reuse spans the whole pass instead of
         // being lost whenever a hash collides or the addressing shifts.
@@ -158,15 +158,14 @@ namespace Unity.Physics
                 }
             }
 
-            if (!voxelA->m_Sectors.IsCreated || !voxelB->m_Sectors.IsCreated ||
-                voxelA->m_Sectors.IsEmpty || voxelB->m_Sectors.IsEmpty)
+            if (voxelA->Entity.RegionCount == 0 || voxelB->Entity.RegionCount == 0)
             {
                 return;
             }
 
-            // The A-side pass walks A's sectors, so put the smaller body there.
+            // The A-side pass walks A's regions, so put the smaller body there.
             // TODO: Make this more precise perhaps
-            bool isALargerThanB = (voxelA->m_Sectors.Count > voxelB->m_Sectors.Count);
+            bool isALargerThanB = (voxelA->Entity.RegionCount > voxelB->Entity.RegionCount);
             if (isALargerThanB)
             {
                 _VoxelVoxel(
@@ -402,33 +401,17 @@ namespace Unity.Physics
 
         private static unsafe bool ResolveVoxelBrick(
             VoxelCollider* collider,
-            int3 globalBrickCoord,
+            int3 key,
             out VoxelBrickView view)
         {
-            int3 sectorCoord = globalBrickCoord >> Sector.SHIFT_IN_BRICKS;
-            if (!collider->m_Sectors.TryGetValue(sectorCoord, out SectorHandle handle) || handle.IsNull)
-            {
-                view = default;
-                return false;
-            }
-
-            int3 brickInSector = globalBrickCoord & Sector.SECTOR_MASK;
-            Sector* sector = handle.Ptr;
-            short bid = sector->brickIdx[
-                Sector.ToBrickIdx(brickInSector.x, brickInSector.y, brickInSector.z)];
-            if (bid == Sector.BRICKID_EMPTY)
-            {
-                view = default;
-                return false;
-            }
-
-            SectorSlotStorage* blockSlot = sector->slots + (int)SectorSlotId.Block;
-            SectorSlotStorage* physicsSlot = sector->slots + (int)SectorSlotId.PhysicsInfo;
-
-            // Production rebuilds both aux masks before physics. Without either mask this brick
-            // cannot use the sparse contact path safely.
-            if (!blockSlot->IsCreated || !blockSlot->HasAux ||
-                !physicsSlot->IsCreated || !physicsSlot->HasAux)
+            // One cursor for the three binds: they address the same brick, so the region resolves
+            // once. Production rebuilds both aux masks before physics; without either one this
+            // brick cannot use the sparse contact path safely, and a failed bind says so.
+            var cursor = default(BrickCursor);
+            ref VoxelEntityData e = ref collider->Entity;
+            if (!e.TryBindBrick<PhysicsInfo>(SectorSlotId.PhysicsInfo, key, ref cursor, out PhysicsInfo* physics) ||
+                !e.TryBindBrickAux(SectorSlotId.Block, key, ref cursor, out void* occupied) ||
+                !e.TryBindBrickAux(SectorSlotId.PhysicsInfo, key, ref cursor, out void* keys))
             {
                 view = default;
                 return false;
@@ -436,9 +419,9 @@ namespace Unity.Physics
 
             view = new VoxelBrickView
             {
-                Physics = (PhysicsInfo*)physicsSlot->GetBrickPtr(bid),
-                OccupiedMask = (ulong*)blockSlot->GetBrickAuxPtr(bid),
-                PhysicsKeyMask = (ulong*)physicsSlot->GetBrickAuxPtr(bid)
+                Physics = physics,
+                OccupiedMask = (ulong*)occupied,
+                PhysicsKeyMask = (ulong*)keys
             };
             return true;
         }
@@ -446,19 +429,19 @@ namespace Unity.Physics
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe bool TryGetVoxelBrickCached(
             VoxelCollider* collider,
-            int3 globalBrickCoord,
+            int3 key,
             BrickCacheEntry* cache,
             ref VoxelContactQueryCounters counters,
             out VoxelBrickView view)
         {
             counters.BrickLookups++;
 
-            int slot = (globalBrickCoord.x & k_BrickCacheAxisMask)
-                | ((globalBrickCoord.y & k_BrickCacheAxisMask) << 2)
-                | ((globalBrickCoord.z & k_BrickCacheAxisMask) << 4);
+            int slot = (key.x & k_BrickCacheAxisMask)
+                | ((key.y & k_BrickCacheAxisMask) << 2)
+                | ((key.z & k_BrickCacheAxisMask) << 4);
 
             BrickCacheEntry entry = cache[slot];
-            if (entry.Valid && math.all(entry.Coord == globalBrickCoord))
+            if (entry.Valid && math.all(entry.Coord == key))
             {
                 counters.BrickCacheHits++;
                 view = entry.View;
@@ -466,10 +449,10 @@ namespace Unity.Physics
             }
 
             counters.BrickResolves++;
-            bool present = ResolveVoxelBrick(collider, globalBrickCoord, out view);
+            bool present = ResolveVoxelBrick(collider, key, out view);
             cache[slot] = new BrickCacheEntry
             {
-                Coord = globalBrickCoord,
+                Coord = key,
                 View = view,
                 Valid = true,
                 Present = present
@@ -511,8 +494,8 @@ namespace Unity.Physics
                 sourcePointInTarget, sourcePointInTarget, reach, out int3 lower, out int3 upper);
 
             int recentCount = 0;
-            int3 lowerBrick = lower >> Sector.SHIFT_IN_BLOCKS;
-            int3 upperBrick = upper >> Sector.SHIFT_IN_BLOCKS;
+            int3 lowerBrick = lower >> BrickKey.Shift;
+            int3 upperBrick = upper >> BrickKey.Shift;
 
             for (int brickZ = lowerBrick.z; brickZ <= upperBrick.z; brickZ++)
             {
@@ -527,9 +510,9 @@ namespace Unity.Physics
                             continue;
                         }
 
-                        int3 brickOrigin = brickCoord * Sector.SIZE_IN_BLOCKS;
+                        int3 brickOrigin = BrickKey.ToBlockOrigin(brickCoord);
                         int3 localLower = math.max(lower - brickOrigin, int3.zero);
-                        int3 localUpper = math.min(upper - brickOrigin, new int3(Sector.BRICK_MASK));
+                        int3 localUpper = math.min(upper - brickOrigin, new int3(BrickKey.Mask));
                         if (math.any(localLower > localUpper))
                         {
                             continue;
@@ -669,8 +652,8 @@ namespace Unity.Physics
             ComputeTargetRootWindow(sourceMinimum, sourceMaximum, reach, out int3 lower, out int3 upper);
 
             int recentCount = 0;
-            int3 lowerBrick = lower >> Sector.SHIFT_IN_BLOCKS;
-            int3 upperBrick = upper >> Sector.SHIFT_IN_BLOCKS;
+            int3 lowerBrick = lower >> BrickKey.Shift;
+            int3 upperBrick = upper >> BrickKey.Shift;
 
             for (int brickZ = lowerBrick.z; brickZ <= upperBrick.z; brickZ++)
             {
@@ -685,9 +668,9 @@ namespace Unity.Physics
                             continue;
                         }
 
-                        int3 brickOrigin = brickCoord * Sector.SIZE_IN_BLOCKS;
+                        int3 brickOrigin = BrickKey.ToBlockOrigin(brickCoord);
                         int3 localLower = math.max(lower - brickOrigin, int3.zero);
-                        int3 localUpper = math.min(upper - brickOrigin, new int3(Sector.BRICK_MASK));
+                        int3 localUpper = math.min(upper - brickOrigin, new int3(BrickKey.Mask));
                         if (math.any(localLower > localUpper))
                         {
                             continue;
@@ -865,8 +848,8 @@ namespace Unity.Physics
         //   A, skipping target points because pass 1 already emitted every vertex-vertex pair.
         //
         // A key block is a root carrying an active point or an active edge, which is exactly the
-        // source set the two queries need. Probes read the opposite body through its sector map
-        // directly, so windows cross sector boundaries without a per-sector-pair loop.
+        // source set the two queries need. Probes read the opposite body by brick key directly, so
+        // windows cross region boundaries without a per-region-pair loop.
         static unsafe void CollectVoxelContacts(
             VoxelCollider* voxelA,
             VoxelCollider* voxelB,
@@ -875,8 +858,6 @@ namespace Unity.Physics
             ref VoxelContactCounters counters,
             ref UnsafeList<VoxelContact> contacts)
         {
-            var sectorsA = voxelA->m_Sectors;
-
             MTransform aFromB = Inverse(bFromA);
 
             // Conservative per-axis extent of a rotated A box in B space, for culling only.
@@ -905,24 +886,23 @@ namespace Unity.Physics
             }
 
 
-            var keysA = sectorsA.GetKeyArray(Allocator.Temp);
-            for (int iSectorA = 0; iSectorA < keysA.Length; iSectorA++)
+            var regionsA = voxelA->Entity.GetRegionPositions(Allocator.Temp);
+            for (int iRegionA = 0; iRegionA < regionsA.Length; iRegionA++)
             {
-                int3 sectorCoordA = keysA[iSectorA];
-                var sectorA = sectorsA[sectorCoordA];
-                int3 sectorOriginA = sectorCoordA * Sector.SECTOR_SIZE_IN_BLOCKS;
+                int3 regionPosA = regionsA[iRegionA];
+                int3 regionOriginA = VoxelRegion.OriginOf(regionPosA);
 
-                if (SectorCannotReachB(
-                        sectorOriginA, bFromA, rowAbsSum, cullingWindowHalfWidth,
+                if (RegionCannotReachB(
+                        regionOriginA, bFromA, rowAbsSum, cullingWindowHalfWidth,
                         boundsCenterB, boundsHalfB))
                 {
                     continue;
                 }
 
-                foreach (SectorNonEmptyBrickEnumerator.BrickRef brickRef in sectorA.Ptr->EnumerateNonEmptyBricks())
+                foreach (int3 keyA in voxelA->Entity.EnumerateBricks(
+                    VoxelRegion.FirstKeyOf(regionPosA), VoxelRegion.LastKeyOf(regionPosA)))
                 {
-                    int3 brickOriginBlocks = sectorOriginA
-                        + Sector.ToBrickPos((short)brickRef.BrickAbs) * Sector.SIZE_IN_BLOCKS;
+                    int3 brickOriginBlocks = BrickKey.ToBlockOrigin(keyA);
 
                     // Marking is unconditional: a key-less A brick still owns cells that the
                     // B-side pass must reach. Only the key enumeration below is gated on it.
@@ -936,8 +916,8 @@ namespace Unity.Physics
 
                     counters.SourceBricks++;
 
-                    foreach (SectorBitmaskSlotIterator<PhysicsInfo> blockIter in
-                        sectorA.Ptr->EnumeratePhysicsKeyBlocksInBrick(brickRef.Bid, brickOriginBlocks))
+                    foreach (var blockIter in voxelA->Entity.EnumerateBrickBitmask<PhysicsInfo>(
+                        SectorSlotId.PhysicsInfo, keyA))
                     {
                         HandleSourceBlock(
                             blockIter.position, blockIter.value, voxelA, voxelB,
@@ -947,7 +927,7 @@ namespace Unity.Physics
                     }
                 }
             }
-            keysA.Dispose();
+            regionsA.Dispose();
 
             BrickCacheEntry* cacheA = stackalloc BrickCacheEntry[k_BrickCacheSize];
             for (int i = 0; i < k_BrickCacheSize; i++)
@@ -956,21 +936,13 @@ namespace Unity.Physics
             }
 
 
-            foreach (int3 brickCoordB in overlappedBricksB)
+            foreach (int3 keyB in overlappedBricksB)
             {
-                int3 sectorCoordB = brickCoordB >> Sector.SHIFT_IN_BRICKS;
-                int3 brickPosInSector = brickCoordB & Sector.SECTOR_MASK;
-
-                // Present and allocated by construction: only allocated B bricks get marked.
-                var sectorB = voxelB->m_Sectors[sectorCoordB];
-                short bid = sectorB.Ptr->brickIdx[
-                    Sector.ToBrickIdx(brickPosInSector.x, brickPosInSector.y, brickPosInSector.z)];
-
-                int3 brickOriginBlocks = brickCoordB * Sector.SIZE_IN_BLOCKS;
                 counters.SourceBricks++;
 
-                foreach (SectorBitmaskSlotIterator<PhysicsInfo> blockIter in
-                    sectorB.Ptr->EnumeratePhysicsKeyBlocksInBrick(bid, brickOriginBlocks))
+                // Present and allocated by construction: only allocated B bricks get marked.
+                foreach (var blockIter in voxelB->Entity.EnumerateBrickBitmask<PhysicsInfo>(
+                    SectorSlotId.PhysicsInfo, keyB))
                 {
                     HandleSourceBlock(
                         blockIter.position, blockIter.value, voxelA, voxelB,
@@ -982,47 +954,38 @@ namespace Unity.Physics
             overlappedBricksB.Dispose();
         }
 
-        // Whole-body bounds of B in its own grid, at sector granularity, for A-sector culling.
-        // Returns false when B holds no sectors at all.
+        // Whole-body bounds of B in its own grid, at region granularity, for A-region culling.
+        // Returns false when B holds no storage at all.
         static unsafe bool ComputeBodyBoundsInB(
             VoxelCollider* voxelB,
             out float3 boundsCenterB,
             out float3 boundsHalfB)
         {
-            var keysB = voxelB->m_Sectors.GetKeyArray(Allocator.Temp);
-            if (keysB.Length == 0)
+            if (!voxelB->Entity.TryGetStorageBounds(out int3 minBlockB, out int3 maxBlockExclusiveB))
             {
-                keysB.Dispose();
                 boundsCenterB = default;
                 boundsHalfB = default;
                 return false;
             }
-            int3 sectorMinB = keysB[0];
-            int3 sectorMaxB = keysB[0];
-            for (int i = 1; i < keysB.Length; i++)
-            {
-                sectorMinB = math.min(sectorMinB, keysB[i]);
-                sectorMaxB = math.max(sectorMaxB, keysB[i]);
-            }
-            keysB.Dispose();
-            boundsCenterB = (float3)(sectorMinB + sectorMaxB + 1) * (0.5f * Sector.SECTOR_SIZE_IN_BLOCKS);
-            boundsHalfB = (float3)(sectorMaxB + 1 - sectorMinB) * (0.5f * Sector.SECTOR_SIZE_IN_BLOCKS);
+
+            boundsCenterB = (float3)(minBlockB + maxBlockExclusiveB) * 0.5f;
+            boundsHalfB = (float3)(maxBlockExclusiveB - minBlockB) * 0.5f;
             return true;
         }
 
-        // Conservative A-sector-vs-whole-B reachability cull for the contact path.
-        static bool SectorCannotReachB(
-            int3 sectorOriginA,
+        // Conservative A-region-vs-whole-B reachability cull for the contact path.
+        static bool RegionCannotReachB(
+            int3 regionOriginA,
             in MTransform bFromA,
             float3 rowAbsSum,
             float cullingWindowHalfWidth,
             float3 boundsCenterB,
             float3 boundsHalfB)
         {
-            float3 sectorCenterInB = Mul(bFromA, (float3)sectorOriginA + 0.5f * Sector.SECTOR_SIZE_IN_BLOCKS);
-            float3 sectorHalfExtentInB = (0.5f * Sector.SECTOR_SIZE_IN_BLOCKS) * rowAbsSum;
-            float3 sectorDelta = math.abs(sectorCenterInB - boundsCenterB);
-            return math.any(sectorDelta > sectorHalfExtentInB + boundsHalfB + cullingWindowHalfWidth);
+            float3 regionCenterInB = Mul(bFromA, (float3)regionOriginA + 0.5f * VoxelRegion.SizeInBlocks);
+            float3 regionHalfExtentInB = (0.5f * VoxelRegion.SizeInBlocks) * rowAbsSum;
+            float3 regionDelta = math.abs(regionCenterInB - boundsCenterB);
+            return math.any(regionDelta > regionHalfExtentInB + boundsHalfB + cullingWindowHalfWidth);
         }
 
         // Tests one A brick (8^3 blocks, given by its min-corner block coord in A grid) against
@@ -1045,12 +1008,9 @@ namespace Unity.Physics
 
             bool any = false;
 
-            // One-entry sector cache: the (tiny) brick range rarely straddles a sector boundary.
-            // TODO: Fold into the future per-thread sector/brick cache shared with voxel queries.
-            int3 cachedSectorCoord = default;
-            SectorHandle cachedHandle = default;
-            bool cacheValid = false;
-            bool cachedExists = false;
+            // One-entry region cache: the (tiny) brick range rarely straddles a region boundary.
+            // TODO: Fold into the future per-thread brick cache shared with voxel queries.
+            var cursor = default(BrickCursor);
 
             for (int gz = brickLo.z; gz <= brickHi.z; gz++)
             {
@@ -1059,22 +1019,7 @@ namespace Unity.Physics
                     for (int gx = brickLo.x; gx <= brickHi.x; gx++)
                     {
                         int3 brickCoord = new int3(gx, gy, gz);
-                        int3 sectorCoord = brickCoord >> Sector.SHIFT_IN_BRICKS;
-
-                        if (!cacheValid || math.any(sectorCoord != cachedSectorCoord))
-                        {
-                            cachedExists = voxelB->m_Sectors.TryGetValue(sectorCoord, out cachedHandle)
-                                && !cachedHandle.IsNull;
-                            cachedSectorCoord = sectorCoord;
-                            cacheValid = true;
-                        }
-                        if (!cachedExists)
-                        {
-                            continue;
-                        }
-
-                        int3 p = brickCoord & Sector.SECTOR_MASK;
-                        if (cachedHandle.Ptr->brickIdx[Sector.ToBrickIdx(p.x, p.y, p.z)] == Sector.BRICKID_EMPTY)
+                        if (!voxelB->Entity.IsBrickAllocated(brickCoord, ref cursor))
                         {
                             continue;
                         }
@@ -1101,16 +1046,16 @@ namespace Unity.Physics
         {
             float3 centerInB = Mul(
                 bFromA,
-                (float3)brickOriginBlocksA + 0.5f * Sector.SIZE_IN_BLOCKS);
+                (float3)brickOriginBlocksA + 0.5f * BrickKey.BlocksPerAxis);
             float3 halfExtent =
-                (0.5f * Sector.SIZE_IN_BLOCKS - 0.5f) * rowAbsSum + windowHalfWidth;
+                (0.5f * BrickKey.BlocksPerAxis - 0.5f) * rowAbsSum + windowHalfWidth;
 
             // B cells whose centers can lie inside the dilated cloud, then the bricks holding them
             // (arithmetic shifts floor-divide correctly for negative coordinates).
             int3 cellLo = (int3)math.ceil(centerInB - halfExtent - 0.5f);
             int3 cellHi = (int3)math.floor(centerInB + halfExtent - 0.5f);
-            brickLo = cellLo >> Sector.SHIFT_IN_BLOCKS;
-            brickHi = cellHi >> Sector.SHIFT_IN_BLOCKS;
+            brickLo = cellLo >> BrickKey.Shift;
+            brickHi = cellHi >> BrickKey.Shift;
         }
 
         // -----------------------------------------------------------------------------------

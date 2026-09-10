@@ -150,10 +150,10 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Reloads sector data into each body's VoxelCollider. Must be called on main thread
-        /// before scheduling the physics world build job.
+        /// Rebinds each body's VoxelCollider to its entity's voxel storage. Must be called on main
+        /// thread before scheduling the physics world build job.
         /// </summary>
-        public static unsafe void ReloadColliderSectors(ref PhysicsStepInputs tickBuf)
+        public static unsafe void RefreshColliderEntities(ref PhysicsStepInputs tickBuf)
         {
             var keys = tickBuf.VoxelBodies.GetKeyArray(Allocator.Temp);
             for (int i = 0; i < keys.Length; i++)
@@ -164,8 +164,7 @@ namespace Caelix.Simulation
                 if (!tickBuf.VoxelEntities.TryGetValue(guid, out var entityData)) continue;
 
                 VoxelCollider* vc = (VoxelCollider*)body.collider.GetUnsafePtr();
-                using var sectors = entityData.sectors.ToNativeHashMap(Allocator.Temp);
-                vc->ReloadSectors(sectors);
+                vc->SetEntity(entityData);
             }
             keys.Dispose();
         }
@@ -186,8 +185,8 @@ namespace Caelix.Simulation
             world.Reset(nStatic, nDynamic, 0);
             world.DynamicsWorld.EnableDirectSolver = enableDirectSolver;
 
-            // Reload sector data into colliders (unsafe, must run on main thread)
-            ReloadColliderSectors(ref tickBuf);
+            // Rebind colliders to their entity storage (unsafe, must run on main thread)
+            RefreshColliderEntities(ref tickBuf);
 
             // Persistent, not TempJob: the mapping outlives the step. Post-step brick-overlap
             // queries translate this step's transient body indices back to stable GUIDs, and a

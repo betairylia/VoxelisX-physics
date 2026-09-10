@@ -23,27 +23,12 @@ namespace Caelix.Tests
         sealed class VoxelColliderFixture : IDisposable
         {
             readonly EntityDataTestScope m_Scope = new EntityDataTestScope();
-            readonly Dictionary<int3, SectorHandle> m_Sectors =
-                new Dictionary<int3, SectorHandle>();
 
             public BlobAssetReference<Collider> Collider { get; private set; }
 
-            public SectorHandle AddSector(int3 sectorCoord)
+            public void SetBlock(int3 regionPos, int3 localBlock, Block block)
             {
-                if (m_Sectors.TryGetValue(sectorCoord, out SectorHandle existing))
-                {
-                    return existing;
-                }
-
-                SectorHandle handle = m_Scope.AddSector(sectorCoord);
-                m_Sectors.Add(sectorCoord, handle);
-                return handle;
-            }
-
-            public void SetBlock(int3 sectorCoord, int3 localBlock, Block block)
-            {
-                SectorHandle sector = AddSector(sectorCoord);
-                sector.SetBlock(localBlock.x, localBlock.y, localBlock.z, block);
+                m_Scope.Data.SetBlock(VoxelRegion.OriginOf(regionPos) + localBlock, block);
             }
 
             public void Build()
@@ -60,14 +45,10 @@ namespace Caelix.Tests
 
                 // Match production: the overlap query consumes allocated bricks, while regular
                 // physics continues to consume refreshed occupancy and physics-key masks.
-                foreach (SectorHandle handle in m_Sectors.Values)
+                // MarkRequired only marks bricks that exist, so this runs after every SetBlock.
+                foreach (int3 key in m_Scope.Data.EnumerateBricks())
                 {
-                    ref Sector sector = ref handle.Get();
-                    for (int brick = 0; brick < Sector.BRICKS_IN_SECTOR; brick++)
-                    {
-                        sector.MarkBrickRequireUpdate(
-                            brick, DirtyFlags.GeometryWithLocalNeighbor);
-                    }
+                    m_Scope.Data.MarkRequired(key, DirtyFlags.GeometryWithLocalNeighbor);
                 }
 
                 m_Scope.Data.RefreshNonEmptyMask(DirtyFlags.GeometryWithLocalNeighbor);
@@ -82,20 +63,17 @@ namespace Caelix.Tests
                     bodyData.Dispose();
                 }
 
-                Collider = VoxelCollider.Create(m_Sectors, filter, material);
+                Collider = VoxelCollider.Create(m_Scope.Data, filter, material);
             }
 
             public void Dispose()
             {
                 if (Collider.IsCreated)
                 {
-                    // VoxelCollider owns a persistent hash map stored inside its blob. Blob
-                    // disposal alone cannot invoke the collider's custom Dispose method.
+                    // The entity owns the voxel storage; the collider only views it. Dispose is a
+                    // no-op today and is called so a future collider-owned resource is released.
                     var voxel = (VoxelCollider*)Collider.GetUnsafePtr();
-                    if (voxel->m_Sectors.IsCreated)
-                    {
-                        voxel->Dispose();
-                    }
+                    voxel->Dispose();
                     Collider.Dispose();
                 }
 
@@ -295,7 +273,7 @@ namespace Caelix.Tests
             using var source = new VoxelColliderFixture();
             using var target = new VoxelColliderFixture();
 
-            // Sector -1, local block 120 is global block -8 and global brick -1.
+            // Region -1, local block 120 is entity-local block -8 and brick key -1.
             source.SetBlock(new int3(-1, 0, 0), new int3(120, 0, 0), new Block(1));
 
             // Allocated-but-empty target bricks intentionally participate.

@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
@@ -20,13 +19,17 @@ namespace Unity.Physics
         // Mass properties (can be set externally via SetMassProperties)
         private MassProperties m_MassProperties;
 
-        public UnsafeHashMap<int3, SectorHandle> m_Sectors;
+        /// <summary>
+        /// The voxel storage this collider reads, as the brick-key facade. The owning entity owns
+        /// the storage; this is a view with pointer semantics, so it needs no per-tick copy.
+        /// </summary>
+        public VoxelEntityData Entity;
 
         /// <summary>
         /// Calculate the axis-aligned bounding box of this voxel collider in local space.
-        /// Returns an AABB that encompasses all sectors, treating each sector as a 128x128x128 box.
+        /// Returns an AABB that encompasses the entity's whole storage box.
         /// </summary>
-        /// <returns>The local-space AABB covering all sectors, or an empty AABB if no sectors exist.</returns>
+        /// <returns>The local-space AABB covering the entity's storage, or an empty AABB if it holds none.</returns>
         public Aabb CalculateAabb()
         {
             return CalculateAabb(RigidTransform.identity);
@@ -38,43 +41,23 @@ namespace Unity.Physics
         /// </summary>
         /// <param name="transform">The rigid transform to apply (rotation and translation).</param>
         /// <param name="uniformScale">Uniform scale factor to apply (default: 1.0).</param>
-        /// <returns>The transformed AABB covering all sectors.</returns>
+        /// <returns>The transformed AABB covering the entity's storage.</returns>
         public Aabb CalculateAabb(RigidTransform transform, float uniformScale = 1.0f)
         {
-            // If no sectors exist, return an empty AABB
-            if (!m_Sectors.IsCreated || m_Sectors.IsEmpty)
+            // If the entity holds no storage at all, return an empty AABB.
+            if (!Entity.TryGetStorageBounds(out int3 minBlock, out int3 maxBlockExclusive))
             {
                 return Aabb.Empty;
             }
 
-            // Start with an empty AABB and expand it to include all sectors
+            // Residency-sized bound on purpose: a region contributes its whole box even when only
+            // one brick in it is allocated. Sector.blockAABB is a grow-only upper bound that is
+            // never shrunk, not persisted, and not maintained by every writer (see its field doc in
+            // Caelix-Core Sector.cs), so a per-region content bound needs a RecomputeBlockAABB pass
+            // that does not exist yet.
             Aabb localAabb = Aabb.Empty;
-
-            // Iterate through all sectors and union their AABBs
-            var keys = m_Sectors.GetKeyArray(Allocator.Temp);
-            for (int i = 0; i < keys.Length; i++)
-            {
-                int3 sectorCoord = keys[i];
-
-                // Each sector is 128x128x128 blocks in size
-                // Calculate the min and max corners of this sector in local space
-                float3 sectorMin = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS;
-                float3 sectorMax = (sectorCoord + 1) * Sector.SECTOR_SIZE_IN_BLOCKS;
-                
-                // Whole-sector bound on purpose. Sector.blockAABB is a grow-only upper bound that is
-                // never shrunk, not persisted, and not maintained by every writer (see its field doc in
-                // Caelix-Core Sector.cs). Switch to it once a RecomputeBlockAABB pass exists:
-                // float3 sectorMin = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS + m_Sectors[keys[i]].Ptr->blockAABB.Min;
-                // float3 sectorMax = sectorCoord * Sector.SECTOR_SIZE_IN_BLOCKS + m_Sectors[keys[i]].Ptr->blockAABB.Max;
-
-                if (!math.any(sectorMin >= sectorMax))
-                {
-                    // Expand the overall AABB to include this sector
-                    localAabb.Include(sectorMin);
-                    localAabb.Include(sectorMax);
-                }
-            }
-            keys.Dispose();
+            localAabb.Include((float3)minBlock);
+            localAabb.Include((float3)maxBlockExclusive);
 
             // Transform the local AABB by the given transform and scale
             // This handles rotation properly by transforming the corner points
@@ -354,12 +337,12 @@ namespace Unity.Physics
         }
 
         /// <summary>
-        /// Creates a VoxelCollider from a sector map.
+        /// Creates a VoxelCollider over one entity's voxel storage.
         /// Note: Mass properties are initialized with default values (mass=1, inertia tensor identity).
         /// Call SetMassProperties() on the created collider to apply computed mass properties.
         /// </summary>
         public static BlobAssetReference<Collider> Create(
-            IDictionary<int3, SectorHandle> sectorMap,
+            in VoxelEntityData entity,
             CollisionFilter filter, Material material)
         {
             unsafe
@@ -390,40 +373,30 @@ namespace Unity.Physics
                     AngularExpansionFactor = 0.0f
                 };
 
-                // Initialize sectors
-                collider.m_Sectors = new UnsafeHashMap<int3, SectorHandle>(sectorMap?.Count ?? 1, Allocator.Persistent);
-                collider.ReloadSectors(sectorMap);
+                // Bind the entity's storage. A default entity is a valid empty one.
+                collider.Entity = entity;
 
                 return BlobAssetReference<Collider>.Create(&collider, sizeof(VoxelCollider));
             }
         }
 
-        public void ReloadSectors(IDictionary<int3, SectorHandle> sectorMap)
+        /// <summary>
+        /// Rebinds this collider to an entity's voxel storage. The facade has pointer semantics, so
+        /// this is an assignment rather than a copy of the storage index.
+        /// </summary>
+        public void SetEntity(in VoxelEntityData entity)
         {
-            if (sectorMap == null) return;
-            m_Sectors.Clear();
-            foreach (var kvp in sectorMap)
-            {
-                m_Sectors.Add(kvp.Key, kvp.Value);
-            }
-            m_Header.Version++;
-        }
-        
-        // TODO: Modify this so we don't copy?
-        public void ReloadSectors(NativeHashMap<int3, SectorHandle> sectorMap)
-        {
-            if (!sectorMap.IsCreated) return;
-            m_Sectors.Clear();
-            foreach (var kvp in sectorMap)
-            {
-                m_Sectors.Add(kvp.Key, kvp.Value);
-            }
+            Entity = entity;
             m_Header.Version++;
         }
 
+        /// <summary>
+        /// No-op: the entity owns its voxel storage and this collider only holds a view of it.
+        /// Kept so <c>VoxelBodyData.Dispose</c> and the test fixtures still compile and so a future
+        /// collider-owned resource has a place to be released.
+        /// </summary>
         public void Dispose()
         {
-            m_Sectors.Dispose();
         }
     }
 }

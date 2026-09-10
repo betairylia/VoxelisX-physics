@@ -25,7 +25,7 @@ namespace Caelix.Simulation
     ///
     /// Each source brick hands the flags it was queried with to every alien brick the graph
     /// pairs it with, exactly as the previous spatial-hash pass did: the target brick's
-    /// RequireUpdate flags widen, its dirty flags do not, and no sector or brick is allocated.
+    /// RequireUpdate flags widen, its dirty flags do not, and no storage is allocated.
     /// </summary>
     public static class BrickOverlapDirtyPropagation
     {
@@ -121,7 +121,7 @@ namespace Caelix.Simulation
 
             /// <summary>
             /// Widens one alien brick's RequireUpdate flags. Returns false when the brick is
-            /// gone: propagation never creates a sector or a brick.
+            /// gone: propagation never creates storage, neither a region nor a brick.
             /// </summary>
             bool MarkBrick(BrickOverlapKey key, ushort flags)
             {
@@ -130,25 +130,8 @@ namespace Caelix.Simulation
                     return false;
                 }
 
-                // Arithmetic shift and mask are the floor-division pair the physics-side query
-                // used to split a global brick coordinate, so negative sectors round the same way.
-                int3 sectorCoord = key.BrickCoord >> Sector.SHIFT_IN_BRICKS;
-                if (!entity.sectors.TryGetValue(sectorCoord, out SectorHandle handle) || handle.IsNull)
-                {
-                    return false;
-                }
-
-                int3 brickInSector = key.BrickCoord & Sector.SECTOR_MASK;
-                int brickIdx = Sector.ToBrickIdx(brickInSector.x, brickInSector.y, brickInSector.z);
-
-                ref Sector sector = ref handle.Get();
-                if (sector.brickIdx[brickIdx] == Sector.BRICKID_EMPTY)
-                {
-                    return false;
-                }
-
-                sector.MarkBrickRequireUpdate(brickIdx, (DirtyFlags)flags);
-                return true;
+                // MarkRequired marks an EXISTING brick only, and reports whether it did.
+                return entity.MarkRequired(key.BrickCoord, (DirtyFlags)flags);
             }
         }
     }

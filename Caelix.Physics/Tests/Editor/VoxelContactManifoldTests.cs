@@ -22,32 +22,21 @@ namespace Caelix.Tests
         // ------------------------------------------------------------------ harness
 
         /// <summary>
-        /// One voxel body: an entity-data scope plus the sector map a VoxelCollider needs.
-        /// Set accepts global block coordinates and creates sectors on demand.
+        /// One voxel body: an entity-data scope whose storage a VoxelCollider reads.
+        /// Set accepts entity-local block coordinates and creates storage on demand.
         /// </summary>
         sealed class VoxelBodyFixture : IDisposable
         {
             public EntityDataTestScope Scope;
-            public UnsafeHashMap<int3, SectorHandle> Sectors;
 
             public VoxelBodyFixture()
             {
                 Scope = new EntityDataTestScope();
-                Sectors = new UnsafeHashMap<int3, SectorHandle>(4, Allocator.Persistent);
             }
 
             public void Set(int x, int y, int z)
             {
-                int3 global = new int3(x, y, z);
-                int3 sectorCoord = global >> (Sector.SHIFT_IN_BLOCKS + Sector.SHIFT_IN_BRICKS);
-                if (!Scope.Data.sectors.TryGetValue(sectorCoord, out SectorHandle sector))
-                {
-                    sector = Scope.AddSector(sectorCoord);
-                    Sectors.Add(sectorCoord, sector);
-                }
-
-                int3 local = global & (Sector.SECTOR_SIZE_IN_BLOCKS - 1);
-                sector.SetBlock(local.x, local.y, local.z, new Block(1));
+                Scope.Data.SetBlock(new int3(x, y, z), new Block(1));
             }
 
             /// <summary>
@@ -56,13 +45,10 @@ namespace Caelix.Tests
             /// </summary>
             public void Build()
             {
-                foreach (var kvp in Scope.Data.sectors)
+                // MarkRequired only marks bricks that exist, so this runs after every Set.
+                foreach (int3 key in Scope.Data.EnumerateBricks())
                 {
-                    ref Sector sector = ref kvp.Value.Get();
-                    for (int i = 0; i < Sector.BRICKS_IN_SECTOR; i++)
-                    {
-                        sector.MarkBrickRequireUpdate(i, DirtyFlags.GeometryWithLocalNeighbor);
-                    }
+                    Scope.Data.MarkRequired(key, DirtyFlags.GeometryWithLocalNeighbor);
                 }
 
                 Scope.Data.RefreshNonEmptyMask(DirtyFlags.GeometryWithLocalNeighbor);
@@ -80,7 +66,6 @@ namespace Caelix.Tests
 
             public void Dispose()
             {
-                Sectors.Dispose();
                 Scope.Dispose();
             }
         }
@@ -122,13 +107,13 @@ namespace Caelix.Tests
                 ScaleB = 1.0f
             };
 
-            // VoxelVoxel only reads m_Sectors and Material, so stack-built colliders suffice.
+            // VoxelVoxel only reads Entity and Material, so stack-built colliders suffice.
             VoxelCollider colliderA = default;
             colliderA.Material = Unity.Physics.Material.Default;
-            colliderA.m_Sectors = bodyA.Sectors;
+            colliderA.Entity = bodyA.Scope.Data;
             VoxelCollider colliderB = default;
             colliderB.Material = Unity.Physics.Material.Default;
-            colliderB.m_Sectors = bodyB.Sectors;
+            colliderB.Entity = bodyB.Scope.Data;
 
             ManifoldQueries.VoxelVoxel(
                 context,
@@ -251,7 +236,7 @@ namespace Caelix.Tests
 
         [TestCase(127, 128)]
         [TestCase(-1, 0)]
-        public void CandidateProbeCrossesSectorBoundary(int voxelA, int voxelB)
+        public void CandidateProbeCrossesRegionBoundary(int voxelA, int voxelB)
         {
             using var a = new VoxelBodyFixture();
             using var b = new VoxelBodyFixture();
@@ -528,7 +513,7 @@ namespace Caelix.Tests
 
             // A is the floor and B is the resting voxel. The floor's interior has no point source,
             // so only the B-side vertex query can produce this vertex-face contact. Both bodies use
-            // one sector, which also prevents the size heuristic from swapping them internally.
+            // one region, which also prevents the size heuristic from swapping them internally.
             List<ParsedManifold> manifolds = Collide(
                 a, b,
                 RigidTransform.identity,

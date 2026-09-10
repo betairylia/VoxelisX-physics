@@ -15,18 +15,21 @@ namespace Caelix.Tests
     public class VoxelEntityPhysicsTests
     {
         [BurstCompile]
-        private struct CountPhysicsKeyBlocksJob : IJob
+        private unsafe struct CountPhysicsKeyBlocksJob : IJob
         {
-            public SectorHandle Sector;
+            [ReadOnly] public VoxelEntityData Entity;
             [WriteOnly] public NativeArray<int> Result;
 
             public void Execute()
             {
                 int count = 0;
-                foreach (SectorBitmaskSlotIterator<PhysicsInfo> item in
-                         Sector.Get().EnumeratePhysicsKeyBlocks())
+                foreach (int3 key in Entity.EnumerateBricks())
                 {
-                    count++;
+                    foreach (SectorBitmaskSlotIterator<PhysicsInfo> item in
+                             Entity.EnumerateBrickBitmask<PhysicsInfo>(SectorSlotId.PhysicsInfo, key))
+                    {
+                        count++;
+                    }
                 }
 
                 Result[0] = count;
@@ -34,15 +37,14 @@ namespace Caelix.Tests
         }
 
         [Test]
-        public void SectorMassMomentsForSingleBlockUseVoxelCenter()
+        public void RegionMassMomentsForSingleBlockUseVoxelCenter()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
-            VoxelEntityPhysics.SectorMassMoments moments =
-                VoxelEntityPhysics.ComputeSectorMassMoments(sector.Get(), int3.zero, PhysicsSettings.Settings);
+            VoxelEntityPhysics.MassMoments moments =
+                VoxelEntityPhysics.ComputeRegionMassMoments(scope.Data, int3.zero, PhysicsSettings.Settings);
 
             Assert.That(moments.Mass, Is.EqualTo(1f));
             Assert.That(moments.FirstMoment, Is.EqualTo(new float3(0.5f, 0.5f, 0.5f)));
@@ -55,13 +57,12 @@ namespace Caelix.Tests
         public void InertiaAroundCenterOfMassUsesParallelAxisTheorem()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
-            sector.SetBlock(2, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
+            scope.Data.SetBlock(new int3(2, 0, 0), new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
-            VoxelEntityPhysics.SectorMassMoments moments =
-                VoxelEntityPhysics.ComputeSectorMassMoments(sector.Get(), int3.zero, PhysicsSettings.Settings);
+            VoxelEntityPhysics.MassMoments moments =
+                VoxelEntityPhysics.ComputeRegionMassMoments(scope.Data, int3.zero, PhysicsSettings.Settings);
 
             float3 centerOfMass = moments.FirstMoment / moments.Mass;
             float3 inertia = VoxelEntityPhysics.InertiaAroundCenterOfMass(moments, centerOfMass);
@@ -72,29 +73,29 @@ namespace Caelix.Tests
         }
 
         [Test]
-        public void SectorMassMomentsIncludeSectorBlockPosition()
+        public void RegionMassMomentsIncludeRegionBlockPosition()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            // The first block of region (1,0,0), i.e. one region along x from the origin.
+            scope.Data.SetBlock(new int3(VoxelRegion.SizeInBlocks, 0, 0), new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
-            VoxelEntityPhysics.SectorMassMoments moments =
-                VoxelEntityPhysics.ComputeSectorMassMoments(
-                    sector.Get(),
-                    new int3(Sector.SECTOR_SIZE_IN_BLOCKS, 0, 0),
+            VoxelEntityPhysics.MassMoments moments =
+                VoxelEntityPhysics.ComputeRegionMassMoments(
+                    scope.Data,
+                    new int3(1, 0, 0),
                     PhysicsSettings.Settings);
 
             Assert.That(moments.Mass, Is.EqualTo(1f));
-            Assert.That(moments.FirstMoment, Is.EqualTo(new float3(128.5f, 0.5f, 0.5f)));
+            Assert.That(moments.FirstMoment,
+                Is.EqualTo(new float3(VoxelRegion.SizeInBlocks + 0.5f, 0.5f, 0.5f)));
         }
 
         [Test]
-        public void VoxelBodyDataComputesMassPropertiesFromEntitySectors()
+        public void VoxelBodyDataComputesMassPropertiesFromEntityStorage()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -117,8 +118,7 @@ namespace Caelix.Tests
         public void VoxelBodyDataClearsMassPropertiesForStaticBodies()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -144,7 +144,6 @@ namespace Caelix.Tests
         public void RefreshPhysicsSlotClassifiesSolidCubeBoundary()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
 
             // Solid 3x3x3 cube hugging the origin corner; entirely inside brick (0,0,0).
             for (int z = 0; z < 3; z++)
@@ -153,14 +152,15 @@ namespace Caelix.Tests
                 {
                     for (int x = 0; x < 3; x++)
                     {
-                        sector.SetBlock(x, y, z, new Block(1));
+                        scope.Data.SetBlock(new int3(x, y, z), new Block(1));
                     }
                 }
             }
 
             // Physics-slot generation is gated on the require-update (read) buffer that dirty
             // propagation would normally populate; mark it directly since no propagation runs here.
-            sector.Get().MarkBrickRequireUpdate(Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            // MarkRequired skips unallocated bricks, so it must follow the writes above.
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -173,49 +173,49 @@ namespace Caelix.Tests
                 // The minimum corner is a geometric corner of the box, so every surface cell rooted
                 // there is active at once: three boundary faces, three convex edges and the point.
                 // The cube exists too, which is what makes all eight bits set.
-                Assert.That(PhysicsData(sector, 0, 0, 0).data, Is.EqualTo(0xFF),
+                Assert.That(PhysicsData(scope, 0, 0, 0).data, Is.EqualTo(0xFF),
                     "Minimum corner roots every cell, including all seven surface features");
 
                 // A voxel on a box edge keeps the edge running along that box edge, the two boundary
                 // faces meeting there, and its cube. Its point is absorbed by the collinear edges.
-                Assert.That(PhysicsData(sector, 1, 0, 0).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 1, 0, 0).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitEdgeX) | (1 << PhysicsInfo.BitFaceXY) |
                     (1 << PhysicsInfo.BitFaceXZ) | (1 << PhysicsInfo.BitCube)));
 
                 // A voxel in the middle of a flat boundary face keeps only that face. Its edges are
                 // flat subdivisions and its point is interior to the face.
-                Assert.That(PhysicsData(sector, 1, 1, 0).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 1, 1, 0).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitFaceXY) | (1 << PhysicsInfo.BitCube)));
 
                 // The centre voxel is deep inside solid: no surface feature at all, only the volume
                 // cube. This is the case IsInterior now names.
-                Assert.That(PhysicsData(sector, 1, 1, 1).data,
+                Assert.That(PhysicsData(scope, 1, 1, 1).data,
                     Is.EqualTo(1 << PhysicsInfo.BitCube));
-                Assert.That(PhysicsData(sector, 1, 1, 1).IsInterior, Is.True);
-                Assert.That(PhysicsData(sector, 1, 1, 1).HasVolumeCell, Is.True);
+                Assert.That(PhysicsData(scope, 1, 1, 1).IsInterior, Is.True);
+                Assert.That(PhysicsData(scope, 1, 1, 1).HasVolumeCell, Is.True);
 
                 // The maximum side roots no cell that grows forward, but it is still real boundary.
                 // A max-face voxel keeps the two in-plane edges and the face they bound; the max
                 // corner keeps only its point. Under containment dedup all three read as zero.
-                Assert.That(PhysicsData(sector, 2, 0, 0).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 2, 0, 0).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitPoint) | (1 << PhysicsInfo.BitEdgeY) |
                     (1 << PhysicsInfo.BitEdgeZ) | (1 << PhysicsInfo.BitFaceYZ)));
-                Assert.That(PhysicsData(sector, 2, 2, 0).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 2, 2, 0).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitPoint) | (1 << PhysicsInfo.BitEdgeZ)));
-                Assert.That(PhysicsData(sector, 2, 2, 2).data,
+                Assert.That(PhysicsData(scope, 2, 2, 2).data,
                     Is.EqualTo(1 << PhysicsInfo.BitPoint));
-                Assert.That(PhysicsData(sector, 2, 2, 2).IsInterior, Is.False);
+                Assert.That(PhysicsData(scope, 2, 2, 2).IsInterior, Is.False);
 
                 // Keys are the roots carrying an active point or edge, i.e. the twelve box edge
                 // chains and the eight corners. The six face centres and the centre are not keys.
-                Assert.That(IsPhysicsKey(sector, 0, 0, 0), Is.True);
-                Assert.That(IsPhysicsKey(sector, 2, 2, 2), Is.True);
-                Assert.That(IsPhysicsKey(sector, 1, 0, 0), Is.True);
-                Assert.That(IsPhysicsKey(sector, 1, 1, 0), Is.False);
-                Assert.That(IsPhysicsKey(sector, 1, 1, 1), Is.False);
+                Assert.That(IsPhysicsKey(scope, 0, 0, 0), Is.True);
+                Assert.That(IsPhysicsKey(scope, 2, 2, 2), Is.True);
+                Assert.That(IsPhysicsKey(scope, 1, 0, 0), Is.True);
+                Assert.That(IsPhysicsKey(scope, 1, 1, 0), Is.False);
+                Assert.That(IsPhysicsKey(scope, 1, 1, 1), Is.False);
 
                 // Air block inside the allocated brick is cleared, not stale.
-                Assert.That(PhysicsData(sector, 5, 5, 5).data, Is.EqualTo(0));
+                Assert.That(PhysicsData(scope, 5, 5, 5).data, Is.EqualTo(0));
             }
             finally
             {
@@ -227,10 +227,8 @@ namespace Caelix.Tests
         public void RefreshPhysicsSlotRootsIsolatedVoxelAsPoint()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(1, 1, 1, new Block(1));
-            sector.Get().MarkBrickRequireUpdate(
-                Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            scope.Data.SetBlock(new int3(1, 1, 1), new Block(1));
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -239,10 +237,10 @@ namespace Caelix.Tests
                 bodyData.ComputePhysicsProperties(scope.Data);
 
                 // With no face neighbor the bare point is the only cell, and it is the whole body.
-                Assert.That(PhysicsData(sector, 1, 1, 1).data,
+                Assert.That(PhysicsData(scope, 1, 1, 1).data,
                     Is.EqualTo(1 << PhysicsInfo.BitPoint));
-                Assert.That(PhysicsData(sector, 1, 1, 1).HasPointFeature, Is.True);
-                Assert.That(IsPhysicsKey(sector, 1, 1, 1), Is.True);
+                Assert.That(PhysicsData(scope, 1, 1, 1).HasPointFeature, Is.True);
+                Assert.That(IsPhysicsKey(scope, 1, 1, 1), Is.True);
             }
             finally
             {
@@ -254,11 +252,9 @@ namespace Caelix.Tests
         public void RefreshPhysicsSlotKeepsBothWireEndpoints()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(1, 1, 1, new Block(1));
-            sector.SetBlock(2, 1, 1, new Block(1));
-            sector.Get().MarkBrickRequireUpdate(
-                Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            scope.Data.SetBlock(new int3(1, 1, 1), new Block(1));
+            scope.Data.SetBlock(new int3(2, 1, 1), new Block(1));
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -269,14 +265,14 @@ namespace Caelix.Tests
                 // The segment carries the geometry, but both endpoints stay active: an endpoint owns
                 // the cap of directions past the end of the segment, which the segment does not.
                 // Those two points are what lets a wire form a permitted pair against a face.
-                Assert.That(PhysicsData(sector, 1, 1, 1).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 1, 1, 1).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitEdgeX) | (1 << PhysicsInfo.BitPoint)));
-                Assert.That(PhysicsData(sector, 2, 1, 1).data,
+                Assert.That(PhysicsData(scope, 2, 1, 1).data,
                     Is.EqualTo(1 << PhysicsInfo.BitPoint));
 
                 // Both roots carry a point or an edge, so both are contact sources.
-                Assert.That(IsPhysicsKey(sector, 1, 1, 1), Is.True);
-                Assert.That(IsPhysicsKey(sector, 2, 1, 1), Is.True);
+                Assert.That(IsPhysicsKey(scope, 1, 1, 1), Is.True);
+                Assert.That(IsPhysicsKey(scope, 2, 1, 1), Is.True);
             }
             finally
             {
@@ -288,12 +284,10 @@ namespace Caelix.Tests
         public void RefreshPhysicsSlotKeepsBothArmsOfAnLCorner()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(1, 1, 1, new Block(1));
-            sector.SetBlock(2, 1, 1, new Block(1));
-            sector.SetBlock(1, 2, 1, new Block(1));
-            sector.Get().MarkBrickRequireUpdate(
-                Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            scope.Data.SetBlock(new int3(1, 1, 1), new Block(1));
+            scope.Data.SetBlock(new int3(2, 1, 1), new Block(1));
+            scope.Data.SetBlock(new int3(1, 2, 1), new Block(1));
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -304,12 +298,12 @@ namespace Caelix.Tests
                 // No square exists, so both segments stay on the corner voxel and no diagonal square
                 // is fabricated. The corner point is active too - the two arms are not collinear, so
                 // they cannot absorb it - and each arm end keeps its own endpoint.
-                Assert.That(PhysicsData(sector, 1, 1, 1).data, Is.EqualTo(
+                Assert.That(PhysicsData(scope, 1, 1, 1).data, Is.EqualTo(
                     (1 << PhysicsInfo.BitEdgeX) | (1 << PhysicsInfo.BitEdgeY) |
                     (1 << PhysicsInfo.BitPoint)));
-                Assert.That(PhysicsData(sector, 2, 1, 1).data,
+                Assert.That(PhysicsData(scope, 2, 1, 1).data,
                     Is.EqualTo(1 << PhysicsInfo.BitPoint));
-                Assert.That(PhysicsData(sector, 1, 2, 1).data,
+                Assert.That(PhysicsData(scope, 1, 2, 1).data,
                     Is.EqualTo(1 << PhysicsInfo.BitPoint));
             }
             finally
@@ -322,7 +316,6 @@ namespace Caelix.Tests
         public void PhysicsKeyMaskMatchesActivePointAndEdgeBits()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
 
             // A mix that produces every class at once: solid volume with a buried interior, a
             // one-thick plate, a wire with two ends, an L with two arms, and an isolated voxel.
@@ -332,7 +325,7 @@ namespace Caelix.Tests
                 {
                     for (int x = 0; x < 3; x++)
                     {
-                        sector.SetBlock(x, y, z, new Block(1));
+                        scope.Data.SetBlock(new int3(x, y, z), new Block(1));
                     }
                 }
             }
@@ -340,20 +333,19 @@ namespace Caelix.Tests
             {
                 for (int x = 0; x < 5; x++)
                 {
-                    sector.SetBlock(x, y, 5, new Block(1));
+                    scope.Data.SetBlock(new int3(x, y, 5), new Block(1));
                 }
             }
             for (int x = 0; x < 5; x++)
             {
-                sector.SetBlock(x, 7, 7, new Block(1));
+                scope.Data.SetBlock(new int3(x, 7, 7), new Block(1));
             }
-            sector.SetBlock(5, 3, 0, new Block(1));
-            sector.SetBlock(6, 3, 0, new Block(1));
-            sector.SetBlock(5, 4, 0, new Block(1));
-            sector.SetBlock(7, 0, 7, new Block(1));
+            scope.Data.SetBlock(new int3(5, 3, 0), new Block(1));
+            scope.Data.SetBlock(new int3(6, 3, 0), new Block(1));
+            scope.Data.SetBlock(new int3(5, 4, 0), new Block(1));
+            scope.Data.SetBlock(new int3(7, 0, 7), new Block(1));
 
-            sector.Get().MarkBrickRequireUpdate(
-                Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
@@ -370,14 +362,14 @@ namespace Caelix.Tests
                 int checkedVoxels = 0;
                 int keyVoxels = 0;
 
-                for (int z = 0; z < Sector.SIZE_IN_BLOCKS; z++)
+                for (int z = 0; z < BrickKey.BlocksPerAxis; z++)
                 {
-                    for (int y = 0; y < Sector.SIZE_IN_BLOCKS; y++)
+                    for (int y = 0; y < BrickKey.BlocksPerAxis; y++)
                     {
-                        for (int x = 0; x < Sector.SIZE_IN_BLOCKS; x++)
+                        for (int x = 0; x < BrickKey.BlocksPerAxis; x++)
                         {
-                            bool rootsPointOrEdge = (PhysicsData(sector, x, y, z).data & pointOrEdge) != 0;
-                            bool isKey = IsPhysicsKey(sector, x, y, z);
+                            bool rootsPointOrEdge = (PhysicsData(scope, x, y, z).data & pointOrEdge) != 0;
+                            bool isKey = IsPhysicsKey(scope, x, y, z);
                             Assert.That(isKey, Is.EqualTo(rootsPointOrEdge),
                                 $"key bit disagrees with the point/edge bits at ({x},{y},{z})");
 
@@ -390,7 +382,7 @@ namespace Caelix.Tests
                     }
                 }
 
-                Assert.That(checkedVoxels, Is.EqualTo(Sector.BLOCKS_IN_BRICK));
+                Assert.That(checkedVoxels, Is.EqualTo(BrickKey.BlocksInBrick));
 
                 // Guards against the assertion passing vacuously on an all-clear brick, and against
                 // a key mask that simply marks everything.
@@ -407,7 +399,6 @@ namespace Caelix.Tests
         public unsafe void PhysicsKeyEnumeratorFollowsPhysicsInfoBitmapInVoxelIndexOrder()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
 
             // In a 3x3x3 cube the keys are the roots carrying an active point or edge: the eight
             // geometric corners and the twelve box edge chains. The six face centres keep only a
@@ -419,24 +410,26 @@ namespace Caelix.Tests
                 {
                     for (int x = 0; x < 3; x++)
                     {
-                        sector.SetBlock(x, y, z, new Block(1));
+                        scope.Data.SetBlock(new int3(x, y, z), new Block(1));
                     }
                 }
             }
 
-            sector.Get().MarkBrickRequireUpdate(
-                Sector.ToBrickIdx(0, 0, 0), DirtyFlags.GeometryWithLocalNeighbor);
+            scope.Data.MarkRequired(int3.zero, DirtyFlags.GeometryWithLocalNeighbor);
             scope.Data.RefreshNonEmptyMask();
 
             var bodyData = new VoxelBodyData(Allocator.Persistent);
             try
             {
                 bodyData.ComputePhysicsProperties(scope.Data);
-                ref Sector source = ref sector.Get();
-                Assert.That(source.slots[(int)SectorSlotId.PhysicsInfo].HasAux, Is.True);
+                Assert.That(
+                    scope.Data.TryBindBrickAux(SectorSlotId.PhysicsInfo, int3.zero, out void* keyAux),
+                    Is.True,
+                    "the physics-key aux bitmap must exist after the refresh");
+                Assert.That(keyAux != null, Is.True);
 
-                SectorBitmaskSlotEnumerator<PhysicsInfo> enumerator =
-                    source.EnumeratePhysicsKeyBlocks();
+                BrickBitmaskSlotEnumerator<PhysicsInfo> enumerator =
+                    scope.Data.EnumerateBrickBitmask<PhysicsInfo>(SectorSlotId.PhysicsInfo, int3.zero);
                 int selected = 0;
 
                 // Walk in flat voxel-index order (x fastest, then y, then z) and require the
@@ -450,7 +443,7 @@ namespace Caelix.Tests
                             int extremes = (x == 1 ? 0 : 1) + (y == 1 ? 0 : 1) + (z == 1 ? 0 : 1);
                             if (extremes < 2)
                             {
-                                Assert.That(IsPhysicsKey(sector, x, y, z), Is.False,
+                                Assert.That(IsPhysicsKey(scope, x, y, z), Is.False,
                                     $"({x},{y},{z}) is a face centre or the centre");
                                 continue;
                             }
@@ -466,14 +459,16 @@ namespace Caelix.Tests
                 Assert.That(selected, Is.EqualTo(20));
                 Assert.That(enumerator.MoveNext(), Is.False);
 
-                enumerator.Reset();
+                // A fresh enumeration starts over at the first selected root.
+                enumerator = scope.Data.EnumerateBrickBitmask<PhysicsInfo>(
+                    SectorSlotId.PhysicsInfo, int3.zero);
                 Assert.That(enumerator.MoveNext(), Is.True);
                 Assert.That(enumerator.Current.position, Is.EqualTo(int3.zero));
 
                 using var burstCount = new NativeArray<int>(1, Allocator.TempJob);
                 new CountPhysicsKeyBlocksJob
                 {
-                    Sector = sector,
+                    Entity = scope.Data,
                     Result = burstCount
                 }.Schedule().Complete();
                 Assert.That(burstCount[0], Is.EqualTo(20));
@@ -484,27 +479,29 @@ namespace Caelix.Tests
             }
         }
 
-        private static PhysicsInfo PhysicsData(SectorHandle sector, int x, int y, int z)
+        private static PhysicsInfo PhysicsData(EntityDataTestScope scope, int x, int y, int z)
         {
-            return sector.GetSlot<PhysicsInfo>(SectorSlotId.PhysicsInfo, x, y, z);
+            return scope.Data.GetSlot<PhysicsInfo>(SectorSlotId.PhysicsInfo, new int3(x, y, z));
         }
 
-        private static unsafe bool IsPhysicsKey(SectorHandle sector, int x, int y, int z)
+        private static unsafe bool IsPhysicsKey(EntityDataTestScope scope, int x, int y, int z)
         {
-            ref Sector source = ref sector.Get();
-            short bid = source.brickIdx[Sector.ToBrickIdx(
-                x >> Sector.SHIFT_IN_BLOCKS, y >> Sector.SHIFT_IN_BLOCKS, z >> Sector.SHIFT_IN_BLOCKS)];
-            var mask = (ulong*)source.GetBrickAuxPtr(SectorSlotId.PhysicsInfo, bid);
-            return BrickBitmask.GetBit(mask, Sector.ToBlockIdx(
-                x & Sector.BRICK_MASK, y & Sector.BRICK_MASK, z & Sector.BRICK_MASK));
+            int3 pos = new int3(x, y, z);
+            if (!scope.Data.TryBindBrickAux(
+                    SectorSlotId.PhysicsInfo, BrickKey.FromBlock(pos), out void* aux))
+            {
+                return false;
+            }
+
+            int3 local = BrickKey.LocalBlock(pos);
+            return BrickBitmask.GetBit((ulong*)aux, BrickKey.ToBlockIdx(local.x, local.y, local.z));
         }
 
         [Test]
         public void PhysicsWorldBuildReadsPersistedMotionFromVoxelBodyData()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
             Guid128 guid = new Guid128(1, 2, 3, 4);
@@ -581,8 +578,8 @@ namespace Caelix.Tests
         {
             using var dynamicScope = new EntityDataTestScope();
             using var staticScope = new EntityDataTestScope();
-            dynamicScope.AddSector(int3.zero).SetBlock(0, 0, 0, new Block(1));
-            staticScope.AddSector(int3.zero).SetBlock(0, 0, 0, new Block(1));
+            dynamicScope.Data.SetBlock(int3.zero, new Block(1));
+            staticScope.Data.SetBlock(int3.zero, new Block(1));
             dynamicScope.Data.RefreshNonEmptyMask();
             staticScope.Data.RefreshNonEmptyMask();
             staticScope.Data.isStatic = true;
@@ -644,8 +641,8 @@ namespace Caelix.Tests
         {
             using var firstScope = new EntityDataTestScope();
             using var secondScope = new EntityDataTestScope();
-            firstScope.AddSector(int3.zero).SetBlock(0, 0, 0, new Block(1));
-            secondScope.AddSector(int3.zero).SetBlock(0, 0, 0, new Block(1));
+            firstScope.Data.SetBlock(int3.zero, new Block(1));
+            secondScope.Data.SetBlock(int3.zero, new Block(1));
             firstScope.Data.RefreshNonEmptyMask();
             secondScope.Data.RefreshNonEmptyMask();
 
@@ -745,8 +742,7 @@ namespace Caelix.Tests
         public void BodyForceCommandStreamAppliesMainThreadForceBeforePhysicsBuild()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
             Guid128 guid = new Guid128(9, 10, 11, 12);
@@ -783,9 +779,8 @@ namespace Caelix.Tests
         public void BodyForceCommandStreamAppliesOffCenterImpulseTorque()
         {
             using var scope = new EntityDataTestScope();
-            SectorHandle sector = scope.AddSector(int3.zero);
-            sector.SetBlock(0, 0, 0, new Block(1));
-            sector.SetBlock(2, 0, 0, new Block(1));
+            scope.Data.SetBlock(int3.zero, new Block(1));
+            scope.Data.SetBlock(new int3(2, 0, 0), new Block(1));
             scope.Data.RefreshNonEmptyMask();
 
             Guid128 guid = new Guid128(13, 14, 15, 16);

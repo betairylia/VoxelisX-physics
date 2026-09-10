@@ -26,8 +26,8 @@ namespace Unity.Physics
 
     /// <summary>One source brick record in a voxel-brick query batch.</summary>
     /// <remarks>
-    /// <see cref="BrickCoord"/> is a global brick coordinate in the source collider's local
-    /// voxel grid, including sector offsets. <see cref="Flags"/> is source metadata forwarded
+    /// <see cref="BrickCoord"/> is an entity-local brick key in the source collider's voxel
+    /// grid (see <c>BrickKey</c>). <see cref="Flags"/> is source metadata forwarded
     /// to the compile-time target-brick policy hook.
     /// </remarks>
     [StructLayout(LayoutKind.Sequential, Size = 16)]
@@ -45,8 +45,8 @@ namespace Unity.Physics
 
     /// <summary>
     /// One raw overlap between a queried brick and an allocated brick of another voxel body.
-    /// Coordinates are global brick coordinates in each collider's local voxel grid, including
-    /// sector offsets. Results are unsorted and may repeat when the input contains duplicate
+    /// Coordinates are entity-local brick keys in each collider's own voxel grid (see
+    /// <c>BrickKey</c>). Results are unsorted and may repeat when the input contains duplicate
     /// queries, overlapping batches, or both endpoints of the same pair are queried.
     /// </summary>
     public struct VoxelBrickOverlapCandidate
@@ -201,8 +201,8 @@ namespace Unity.Physics
 
         static Aabb QueryWorldAabb(in RigidBody sourceBody, int3 sourceBrick)
         {
-            float3 localMin = (float3)(sourceBrick * Sector.SIZE_IN_BLOCKS) - k_QueryHaloInVoxels;
-            float3 localMax = (float3)((sourceBrick + 1) * Sector.SIZE_IN_BLOCKS) + k_QueryHaloInVoxels;
+            float3 localMin = (float3)BrickKey.ToBlockOrigin(sourceBrick) - k_QueryHaloInVoxels;
+            float3 localMax = (float3)BrickKey.ToBlockOrigin(sourceBrick + 1) + k_QueryHaloInVoxels;
             return TransformAabb(
                 new Aabb { Min = localMin, Max = localMax },
                 sourceBody.WorldFromBody);
@@ -231,8 +231,8 @@ namespace Unity.Physics
 
             VoxelCollider* sourceVoxel = (VoxelCollider*)sourceCollider;
             VoxelCollider* targetVoxel = (VoxelCollider*)targetCollider;
-            return sourceVoxel->m_Sectors.IsCreated && !sourceVoxel->m_Sectors.IsEmpty &&
-                targetVoxel->m_Sectors.IsCreated && !targetVoxel->m_Sectors.IsEmpty &&
+            return sourceVoxel->Entity.RegionCount > 0 &&
+                targetVoxel->Entity.RegionCount > 0 &&
                 Material.GetCombinedCollisionResponse(sourceVoxel->Material, targetVoxel->Material) !=
                 CollisionResponsePolicy.None;
         }
@@ -260,7 +260,7 @@ namespace Unity.Physics
                 // A one-voxel dilation supplies alien-neighborhood reach without changing
                 // regular broadphase or narrowphase tolerances.
                 ManifoldQueries.GetOverlappingBrickRange(
-                    sourceBrick * Sector.SIZE_IN_BLOCKS,
+                    BrickKey.ToBlockOrigin(sourceBrick),
                     targetFromSource,
                     rowAbsSum,
                     k_QueryHaloInVoxels,
@@ -282,10 +282,8 @@ namespace Unity.Physics
             VoxelCollider* targetVoxel,
             ref NativeStream.Writer writer)
         {
-            int3 cachedSectorCoord = default;
-            SectorHandle cachedSector = default;
-            bool cacheValid = false;
-            bool cachedSectorExists = false;
+            // Keys that share a region resolve once; an absent region is cached too.
+            var cursor = default(BrickCursor);
 
             for (int z = brickLo.z; z <= brickHi.z; z++)
             {
@@ -294,26 +292,9 @@ namespace Unity.Physics
                     for (int x = brickLo.x; x <= brickHi.x; x++)
                     {
                         int3 targetBrick = new int3(x, y, z);
-                        int3 sectorCoord = targetBrick >> Sector.SHIFT_IN_BRICKS;
-                        if (!cacheValid || math.any(sectorCoord != cachedSectorCoord))
-                        {
-                            cachedSectorExists = targetVoxel->m_Sectors.TryGetValue(
-                                sectorCoord, out cachedSector) && !cachedSector.IsNull;
-                            cachedSectorCoord = sectorCoord;
-                            cacheValid = true;
-                        }
-                        if (!cachedSectorExists)
-                        {
-                            continue;
-                        }
-
-                        int3 brickInSector = targetBrick & Sector.SECTOR_MASK;
-                        short brickId = cachedSector.Ptr->brickIdx[Sector.ToBrickIdx(
-                            brickInSector.x, brickInSector.y, brickInSector.z)];
-                        if (brickId == Sector.BRICKID_EMPTY ||
+                        if (!targetVoxel->Entity.IsBrickAllocated(targetBrick, ref cursor) ||
                             !ShouldIncludeTargetBrick(
-                                sourceBatch, sourceQuery,
-                                targetVoxel, targetBrick, cachedSector, brickId))
+                                sourceBatch, sourceQuery, targetVoxel, targetBrick))
                         {
                             continue;
                         }
@@ -339,9 +320,7 @@ namespace Unity.Physics
             VoxelBrickOverlapQueryBatch sourceBatch,
             VoxelBrickOverlapQuery sourceQuery,
             VoxelCollider* targetVoxel,
-            int3 targetBrick,
-            SectorHandle targetSector,
-            short targetBrickId)
+            int3 targetBrick)
         {
             return true;
         }

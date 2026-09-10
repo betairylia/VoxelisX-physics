@@ -75,11 +75,11 @@ namespace Caelix.Tests
                         "A clean brick of a moving entity carries only the motion mask.");
                 }
 
-                // The second sector starts one sector (16 bricks) along x.
+                // The second region starts one region (VoxelRegion.SizeInBricks bricks) along x.
                 Assert.That(coords, Is.EquivalentTo(new[]
                 {
                     new int3(1, 0, 0),
-                    new int3(Sector.SIZE_IN_BRICKS, 0, 0)
+                    new int3(VoxelRegion.SizeInBricks, 0, 0)
                 }));
             }
             finally
@@ -145,11 +145,14 @@ namespace Caelix.Tests
             Assert.That(stats.OverlappingSourceBricks, Is.EqualTo(1));
             Assert.That(stats.MarkedBricks, Is.EqualTo(1));
             Assert.That(
-                scope.Target.RequireFlagsAt(int3.zero, new int3(3, 0, 0)) & (ushort)SourceFlag,
+                RequireFlagsAt(scope.Target, int3.zero, new int3(3, 0, 0)) & (ushort)SourceFlag,
                 Is.Not.EqualTo(0));
-            Assert.That(
-                scope.Target.SectorAt(int3.zero).Get().sectorRequireUpdateFlags & (ushort)SourceFlag,
-                Is.Not.EqualTo(0));
+
+            // The brick is also visible as require-update work to the facade's own collector.
+            using var required = new NativeList<RequiredBrick>(Allocator.TempJob);
+            scope.Target.Data.CollectRequiredBricks(default, SourceFlag, false, required);
+            Assert.That(required.Length, Is.EqualTo(1));
+            Assert.That(required[0].Key, Is.EqualTo(new int3(3, 0, 0)));
         }
 
         [Test]
@@ -162,18 +165,26 @@ namespace Caelix.Tests
 
             scope.Propagate(source: (int3.zero, SourceFlag), targetBrick: int3.zero);
 
-            Assert.That(scope.Target.SectorAt(int3.zero).Get().sectorDirtyFlags, Is.EqualTo(0));
+            // Nothing on the target is a SOURCE of dirtiness any more: an enumeration restricted to
+            // dirty bricks yields nothing at all.
+            int dirtyBricks = 0;
+            foreach (BrickSourceFlags b in scope.Target.Data.EnumerateBrickSourceFlags(DirtyFlags.All, true))
+            {
+                dirtyBricks++;
+            }
+
+            Assert.That(dirtyBricks, Is.EqualTo(0));
         }
 
         [Test]
-        public void PropagationSplitsGlobalBrickCoordinatesOfNegativeSectors()
+        public void PropagationSplitsBrickKeysOfNegativeRegions()
         {
             using var scope = new PropagationScope();
             AddAllocatedBrick(scope.Source, int3.zero, int3.zero);
-            // Global brick (-1,-1,-1) is the last brick of sector (-1,-1,-1).
-            int3 targetSector = new int3(-1, -1, -1);
-            int3 brickInSector = new int3(Sector.SIZE_IN_BRICKS - 1);
-            AddAllocatedBrick(scope.Target, targetSector, brickInSector);
+            // Brick key (-1,-1,-1) is the last brick of region (-1,-1,-1).
+            int3 targetRegion = new int3(-1, -1, -1);
+            int3 brickInRegion = new int3(VoxelRegion.SizeInBricks - 1);
+            AddAllocatedBrick(scope.Target, targetRegion, brickInRegion);
             scope.Target.Data.ClearDirtyFlags();
 
             BrickOverlapPropagationStats stats = scope.Propagate(
@@ -182,7 +193,7 @@ namespace Caelix.Tests
 
             Assert.That(stats.MarkedBricks, Is.EqualTo(1));
             Assert.That(
-                scope.Target.RequireFlagsAt(targetSector, brickInSector) & (ushort)SourceFlag,
+                RequireFlagsAt(scope.Target, targetRegion, brickInRegion) & (ushort)SourceFlag,
                 Is.Not.EqualTo(0));
         }
 
@@ -191,8 +202,8 @@ namespace Caelix.Tests
         {
             using var scope = new PropagationScope();
             AddAllocatedBrick(scope.Source, int3.zero, int3.zero);
-            // The sector exists but the addressed brick slot was never allocated.
-            scope.Target.AddSector(int3.zero);
+            // The region exists but the addressed brick was never allocated.
+            scope.Target.Data.EnsureRegion(int3.zero);
             scope.Target.Data.ClearDirtyFlags();
 
             BrickOverlapPropagationStats stats = scope.Propagate(
@@ -200,11 +211,11 @@ namespace Caelix.Tests
                 targetBrick: new int3(5, 0, 0));
 
             Assert.That(stats.MarkedBricks, Is.EqualTo(0));
-            Assert.That(scope.Target.RequireFlagsAt(int3.zero, new int3(5, 0, 0)), Is.EqualTo(0));
+            Assert.That(RequireFlagsAt(scope.Target, int3.zero, new int3(5, 0, 0)), Is.EqualTo(0));
         }
 
         [Test]
-        public void PropagationSkipsAMissingTargetSector()
+        public void PropagationSkipsAMissingTargetRegion()
         {
             using var scope = new PropagationScope();
             AddAllocatedBrick(scope.Source, int3.zero, int3.zero);
@@ -214,8 +225,8 @@ namespace Caelix.Tests
                 targetBrick: new int3(0, 0, 0));
 
             Assert.That(stats.MarkedBricks, Is.EqualTo(0));
-            Assert.That(scope.Target.Data.sectors.Count, Is.EqualTo(0),
-                "Propagation never allocates a sector on the target.");
+            Assert.That(scope.Target.Data.RegionCount, Is.EqualTo(0),
+                "Propagation never allocates storage on the target.");
         }
 
         // ---------------------------------------------------------------- helpers
@@ -231,24 +242,27 @@ namespace Caelix.Tests
         }
 
         /// <summary>
-        /// Allocates one brick. The write dirties it, so every test clears the entity before it
-        /// marks the dirtiness it actually wants to observe.
+        /// Allocates one brick, addressed by its region and its position inside that region. The
+        /// write dirties it, so every test clears the entity before it marks the dirtiness it
+        /// actually wants to observe.
         /// </summary>
-        static void AddAllocatedBrick(EntityDataTestScope entity, int3 sectorPos, int3 brickPos)
+        static void AddAllocatedBrick(EntityDataTestScope entity, int3 regionPos, int3 brickInRegion)
         {
-            SectorHandle sector = entity.Data.sectors.ContainsKey(sectorPos)
-                ? entity.SectorAt(sectorPos)
-                : entity.AddSector(sectorPos);
-
-            int3 blockPos = brickPos * Sector.SIZE_IN_BLOCKS;
-            sector.SetBlock(blockPos.x, blockPos.y, blockPos.z, new Block(1));
+            entity.Data.SetBlock(
+                BrickKey.ToBlockOrigin(VoxelRegion.FirstKeyOf(regionPos) + brickInRegion),
+                new Block(1));
         }
 
         static void MarkBrickDirty(
-            EntityDataTestScope entity, int3 sectorPos, int3 brickPos, DirtyFlags flags)
+            EntityDataTestScope entity, int3 regionPos, int3 brickInRegion, DirtyFlags flags)
         {
-            entity.SectorAt(sectorPos).Get().MarkBrickDirty(
-                Sector.ToBrickIdx(brickPos.x, brickPos.y, brickPos.z), flags);
+            entity.Data.MarkBrickDirty(VoxelRegion.FirstKeyOf(regionPos) + brickInRegion, flags);
+        }
+
+        static ushort RequireFlagsAt(EntityDataTestScope entity, int3 regionPos, int3 brickInRegion)
+        {
+            return (ushort)entity.Data.GetRequiredFlags(
+                VoxelRegion.FirstKeyOf(regionPos) + brickInRegion);
         }
 
         static List<VoxelBrickOverlapQuery> ReadSources(BrickOverlapQueryRequest request, int batchIndex)

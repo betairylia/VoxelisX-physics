@@ -215,6 +215,11 @@ namespace Caelix.Simulation
                 writer.EndForEachIndex();
             }
 
+            /// <remarks>
+            /// This is the bridge-phase reader of SOURCE dirty flags, and the only one in physics:
+            /// it runs inside the tick, after propagation and before the end-of-tick clear. Every
+            /// other physics consumer reads require-update flags instead.
+            /// </remarks>
             int WriteSourceBricks(QueryBodyRef body, ref NativeStream.Writer writer)
             {
                 if (!Entities.TryGetValue(body.EntityId, out VoxelEntityData entity))
@@ -224,41 +229,22 @@ namespace Caelix.Simulation
 
                 // A static entity never contributes motion sources; its bricks must be dirty.
                 ushort motionFlags = entity.isStatic ? (ushort)0 : MotionMask;
+
+                // Without a motion mask a clean brick can never become a source, so whole clean
+                // regions are skipped; with one, every allocated brick is a source.
+                bool dirtyOnly = motionFlags == 0;
                 int written = 0;
 
-                foreach (var kvp in entity.sectors)
+                foreach (BrickSourceFlags b in entity.EnumerateBrickSourceFlags((DirtyFlags)DirtyMask, dirtyOnly))
                 {
-                    if (kvp.Value.IsNull)
+                    ushort flags = (ushort)(motionFlags | (ushort)b.Flags);
+                    if (flags == 0)
                     {
                         continue;
                     }
 
-                    ref Sector sector = ref kvp.Value.Get();
-                    ushort sectorDirty = (ushort)(sector.sectorDirtyFlags & DirtyMask);
-                    if (sectorDirty == 0 && motionFlags == 0)
-                    {
-                        continue;
-                    }
-
-                    int3 sectorBrickOrigin = kvp.Key * Sector.SIZE_IN_BRICKS;
-                    foreach (SectorNonEmptyBrickEnumerator.BrickRef brickRef in sector.EnumerateNonEmptyBricks())
-                    {
-                        int brickAbs = brickRef.BrickAbs;
-                        ushort flags = motionFlags;
-                        if (sectorDirty != 0)
-                        {
-                            flags |= (ushort)(sector.brickDirtyFlags[brickAbs] & DirtyMask);
-                        }
-
-                        if (flags == 0)
-                        {
-                            continue;
-                        }
-
-                        writer.Write(new VoxelBrickOverlapQuery(
-                            sectorBrickOrigin + Sector.ToBrickPos((short)brickAbs), flags));
-                        written++;
-                    }
+                    writer.Write(new VoxelBrickOverlapQuery(b.Key, flags));
+                    written++;
                 }
 
                 return written;

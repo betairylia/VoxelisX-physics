@@ -19,8 +19,8 @@ namespace Caelix
         }
 
         private Allocator allocator;
-        private UnsafeHashMap<int3, VoxelEntityPhysics.SectorMassMoments> sectorMassCache;
-        private VoxelEntityPhysics.SectorMassMoments cachedMassMoments;
+        private UnsafeHashMap<int3, VoxelEntityPhysics.MassMoments> regionMassCache;
+        private VoxelEntityPhysics.MassMoments cachedMassMoments;
         private bool massCacheInitialized;
 
         /// <summary>
@@ -40,7 +40,7 @@ namespace Caelix
         public VoxelBodyData(Allocator allocator)
         {
             this.allocator = allocator;
-            sectorMassCache = default;
+            regionMassCache = default;
             cachedMassMoments = default;
             massCacheInitialized = false;
             accuratePhysics = true;
@@ -70,7 +70,7 @@ namespace Caelix
             };
 
             data.collider = Unity.Physics.VoxelCollider.Create(
-                null,
+                default,
                 Unity.Physics.CollisionFilter.Default,
                 material);
             return data;
@@ -106,13 +106,13 @@ namespace Caelix
         /// </summary>
         public MassProperties ComputePhysicsProperties(in VoxelEntityData entity)
         {
-            RefreshMassPropertiesCache(entity.sectors, entity.isStatic);
-            RefreshPhysicsSlot(entity.sectors, entity.sectorNeighbors);
+            RefreshMassPropertiesCache(in entity, entity.isStatic);
+            RefreshPhysicsSlot(in entity);
             return massProperties;
         }
 
         private void RefreshMassPropertiesCache(
-            SharedHashMap<int3, SectorHandle> sectors,
+            in VoxelEntityData entity,
             bool isStatic,
             DirtyFlags dirtyMask = DirtyFlags.Geometry)
         {
@@ -123,39 +123,49 @@ namespace Caelix
                 return;
             }
 
-            int sectorCount = sectors.Count;
-            if (sectorCount == 0)
+            int regionCount = entity.RegionCount;
+            if (regionCount == 0)
             {
                 ClearMassPropertiesCache();
                 massProperties = default;
                 return;
             }
 
-            bool resetCache = !massCacheInitialized || !sectorMassCache.IsCreated;
-            EnsureMassPropertiesCache(sectorCount, resetCache);
+            bool resetCache = !massCacheInitialized || !regionMassCache.IsCreated;
+            EnsureMassPropertiesCache(regionCount, resetCache);
 
-            bool changed = RemoveMissingSectorMoments(sectors);
+            bool changed = RemoveMissingRegionMoments(in entity);
 
-            var inputs = new NativeList<VoxelEntityPhysics.SectorMassMomentInput>(Allocator.TempJob);
+            var inputs = new NativeList<VoxelEntityPhysics.RegionMassMomentInput>(Allocator.TempJob);
+            var required = new NativeList<RequiredBrick>(Allocator.TempJob);
+            var selected = new NativeHashSet<int3>(math.max(1, regionCount), Allocator.Temp);
+            var regions = entity.GetRegionPositions(Allocator.Temp);
             try
             {
-                foreach (var kvp in sectors)
+                // A region with no cached moments has never been summed, so it is always work.
+                for (int i = 0; i < regions.Length; i++)
                 {
-                    ref Sector sector = ref kvp.Value.Get();
-                    bool cached = sectorMassCache.ContainsKey(kvp.Key);
-                    // Consume the work selected by server dirty propagation, just as
-                    // RefreshPhysicsSlot does. Source dirty flags remain alive for replication
-                    // until EndTick; they describe writes, rather than scheduled consumer work.
-                    if (cached && (sector.sectorRequireUpdateFlags & (ushort)dirtyMask) == 0)
+                    if (!regionMassCache.ContainsKey(regions[i]))
                     {
-                        continue;
+                        selected.Add(regions[i]);
                     }
+                }
 
-                    inputs.Add(new VoxelEntityPhysics.SectorMassMomentInput
+                // Otherwise consume the work selected by server dirty propagation, just as
+                // RefreshPhysicsSlot does. Source dirty flags remain alive for replication
+                // until EndTick; they describe writes, rather than scheduled consumer work.
+                entity.CollectRequiredBricks(default, dirtyMask, false, required);
+                for (int i = 0; i < required.Length; i++)
+                {
+                    selected.Add(VoxelRegion.OfKey(required[i].Key));
+                }
+
+                foreach (int3 regionPos in selected)
+                {
+                    inputs.Add(new VoxelEntityPhysics.RegionMassMomentInput
                     {
-                        SectorPosition = kvp.Key,
-                        SectorBlockPosition = VoxelEntityData.GetSectorBlockPos(kvp.Key),
-                        Sector = kvp.Value
+                        RegionPos = regionPos,
+                        Entity = entity
                     });
                 }
 
@@ -168,8 +178,8 @@ namespace Caelix
                     return;
                 }
 
-                using var results = new NativeArray<VoxelEntityPhysics.SectorMassMomentResult>(inputs.Length, Allocator.TempJob);
-                var job = new VoxelEntityPhysics.ComputeSectorMassMomentsJob
+                using var results = new NativeArray<VoxelEntityPhysics.RegionMassMomentResult>(inputs.Length, Allocator.TempJob);
+                var job = new VoxelEntityPhysics.ComputeRegionMassMomentsJob
                 {
                     settings = PhysicsSettings.Settings,
                     inputs = inputs.AsArray(),
@@ -179,17 +189,17 @@ namespace Caelix
 
                 for (int i = 0; i < results.Length; i++)
                 {
-                    VoxelEntityPhysics.SectorMassMomentResult result = results[i];
-                    VoxelEntityPhysics.SectorMassMoments oldMoments = default;
-                    bool hadCachedSector = sectorMassCache.TryGetValue(result.SectorPosition, out oldMoments);
+                    VoxelEntityPhysics.RegionMassMomentResult result = results[i];
+                    VoxelEntityPhysics.MassMoments oldMoments = default;
+                    bool hadCachedRegion = regionMassCache.TryGetValue(result.RegionPos, out oldMoments);
 
-                    if (hadCachedSector)
+                    if (hadCachedRegion)
                     {
-                        sectorMassCache[result.SectorPosition] = result.Moments;
+                        regionMassCache[result.RegionPos] = result.Moments;
                     }
                     else
                     {
-                        sectorMassCache.Add(result.SectorPosition, result.Moments);
+                        regionMassCache.Add(result.RegionPos, result.Moments);
                     }
 
                     cachedMassMoments += result.Moments - oldMoments;
@@ -199,6 +209,21 @@ namespace Caelix
             }
             finally
             {
+                if (regions.IsCreated)
+                {
+                    regions.Dispose();
+                }
+
+                if (selected.IsCreated)
+                {
+                    selected.Dispose();
+                }
+
+                if (required.IsCreated)
+                {
+                    required.Dispose();
+                }
+
                 if (inputs.IsCreated)
                 {
                     inputs.Dispose();
@@ -208,12 +233,12 @@ namespace Caelix
 
         private void ClearMassPropertiesCache()
         {
-            if (sectorMassCache.IsCreated)
+            if (regionMassCache.IsCreated)
             {
-                sectorMassCache.Dispose();
+                regionMassCache.Dispose();
             }
 
-            sectorMassCache = default;
+            regionMassCache = default;
             cachedMassMoments = default;
             massCacheInitialized = false;
         }
@@ -236,46 +261,46 @@ namespace Caelix
             }
         }
 
-        private void EnsureMassPropertiesCache(int sectorCount, bool rebuild)
+        private void EnsureMassPropertiesCache(int regionCount, bool rebuild)
         {
             if (rebuild)
             {
                 ClearMassPropertiesCache();
             }
 
-            if (!sectorMassCache.IsCreated)
+            if (!regionMassCache.IsCreated)
             {
-                sectorMassCache = new UnsafeHashMap<int3, VoxelEntityPhysics.SectorMassMoments>(
-                    math.max(1, sectorCount),
+                regionMassCache = new UnsafeHashMap<int3, VoxelEntityPhysics.MassMoments>(
+                    math.max(1, regionCount),
                     allocator == Allocator.Invalid ? Allocator.Persistent : allocator);
             }
-            else if (sectorMassCache.Capacity < sectorCount)
+            else if (regionMassCache.Capacity < regionCount)
             {
-                sectorMassCache.Capacity = sectorCount;
+                regionMassCache.Capacity = regionCount;
             }
 
             massCacheInitialized = true;
         }
 
-        private bool RemoveMissingSectorMoments(SharedHashMap<int3, SectorHandle> sectors)
+        private bool RemoveMissingRegionMoments(in VoxelEntityData entity)
         {
-            if (!sectorMassCache.IsCreated || sectorMassCache.Count == 0)
+            if (!regionMassCache.IsCreated || regionMassCache.Count == 0)
             {
                 return false;
             }
 
             bool changed = false;
-            using var cachedKeys = sectorMassCache.GetKeyArray(Allocator.Temp);
+            using var cachedKeys = regionMassCache.GetKeyArray(Allocator.Temp);
             for (int i = 0; i < cachedKeys.Length; i++)
             {
-                int3 sectorPosition = cachedKeys[i];
-                if (sectors.ContainsKey(sectorPosition))
+                int3 regionPos = cachedKeys[i];
+                if (entity.HasRegion(regionPos))
                 {
                     continue;
                 }
 
-                cachedMassMoments -= sectorMassCache[sectorPosition];
-                sectorMassCache.Remove(sectorPosition);
+                cachedMassMoments -= regionMassCache[regionPos];
+                regionMassCache.Remove(regionPos);
                 changed = true;
             }
 
