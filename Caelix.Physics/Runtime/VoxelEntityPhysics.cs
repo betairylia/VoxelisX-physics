@@ -118,7 +118,7 @@ namespace Caelix.Simulation
         {
             MassMoments result = default;
 
-            foreach (SectorBitmaskSlotIterator<Block> blockIter in
+            foreach (BrickSlotEntry<Block> blockIter in
                 new BrickBitmaskSlotEnumerator<Block>(blocks, occupancy, blockOrigin))
             {
                 float mass = settings.GetBlockMass(blockIter.value);

@@ -25,7 +25,7 @@ namespace Caelix.Tests
                 int count = 0;
                 foreach (int3 key in Entity.EnumerateBricks())
                 {
-                    foreach (SectorBitmaskSlotIterator<PhysicsInfo> item in
+                    foreach (BrickSlotEntry<PhysicsInfo> item in
                              Entity.EnumerateBrickBitmask<PhysicsInfo>(SectorSlotId.PhysicsInfo, key))
                     {
                         count++;
